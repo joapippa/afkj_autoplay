@@ -27,7 +27,7 @@ https://www.python.org/downloads/ からインストール（3.8以上推奨）
 ### 2. 必要ライブラリのインストール
 コマンドプロンプト（cmd）で実行：
 ```
-pip install pyautogui opencv-python numpy pillow pygetwindow
+pip install pyautogui opencv-python numpy pillow pygetwindow pywin32
 ```
 
 ### 3. スクショの準備
@@ -65,10 +65,13 @@ python make_templates.py
 | もう一度_btn | 戦闘敗北.png | 右下の「もう一度」ボタン |
 
 ### 5. 自動操作の実行
-AFK Journey を起動し、「ステージ選択」画面（幻霊挑戦ボタンが見える状態）にしてから：
+AFK Journey を起動し、「ステージ選択」画面（幻霊挑戦ボタンが見える状態）にしてから、**管理者権限のターミナル**で実行：
 ```
 python afk_journey_auto.py
 ```
+
+> ⚠️ **管理者権限が必須です。** 通常権限で実行するとクリックがゲームに届きません。
+> Git Bash / PowerShell を右クリック →「管理者として実行」で開いてください。
 
 ---
 
@@ -81,7 +84,7 @@ python afk_journey_auto.py
 ## 注意事項
 
 - **ゲーム画面の解像度を変えないこと**（テンプレート画像と一致しなくなる）
-- 全画面 / ウィンドウモードはどちらでも動作しますが、テンプレート作成時と同じ状態で使用してください
+- **ウィンドウモードで動作確認済み**（全画面モードは未検証）
 - PCのスリープ・スクリーンセーバーはOFFにしてください
 - ゲームのアップデートでUIが変わった場合はテンプレートを作り直してください
 
@@ -94,4 +97,4 @@ python afk_journey_auto.py
 | 「テンプレート画像が見つかりません」 | make_templates.py を再実行してください |
 | ボタンをクリックしてくれない | afk_journey_auto.py の MATCH_THRESHOLD を 0.75 など低くしてみる |
 | 誤検知が多い | MATCH_THRESHOLD を 0.85 など高くしてみる |
-| 戦闘終了を検知しない | MAX_BATTLE_WAIT を増やす（デフォルト300秒） |
+| 戦闘終了を検知しない | MAX_BATTLE_WAIT を増やす（デフォルト3600秒） |
