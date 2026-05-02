@@ -34,14 +34,14 @@ pip install pyautogui opencv-python numpy pillow pygetwindow pywin32
 `screenshots/` フォルダを作成し、以下6枚のスクショを入れてください。
 ゲームを起動する必要はありません。事前に撮影済みのものでOKです。
 
-| ファイル名 | 画面の状態 |
-|---|---|
-| ステージ選択.png | 幻霊挑戦ボタンが見える画面 |
-| 幻霊先鋒ステージ.png | クリア編成・オート挑戦ボタンが見える画面 |
-| クリア編成.png | 一括適用ボタンが見える画面 |
-| オート挑戦中.png | 戦闘中の画面 |
-| オート戦闘終了.png | オート戦闘終了の結果画面 |
-| 戦闘敗北.png | 戦闘敗北の画面 |
+| ファイル名 | 画面の状態 | サンプル |
+|---|---|---|
+| ステージ選択.png | 幻霊挑戦ボタンが見える画面 | ![](screenshots_sample/ステージ選択.png) |
+| 幻霊先鋒ステージ.png | クリア編成・オート挑戦ボタンが見える画面 | ![](screenshots_sample/幻霊先鋒ステージ.png) |
+| クリア編成.png | 一括適用ボタンが見える画面 | ![](screenshots_sample/クリア編成.png) |
+| オート挑戦中.png | 戦闘中の画面 | ![](screenshots_sample/オート挑戦中.png) |
+| オート戦闘終了.png | オート戦闘終了の結果画面 | ![](screenshots_sample/オート戦闘終了.png) |
+| 戦闘敗北.png | 戦闘敗北の画面 | ![](screenshots_sample/戦闘敗北.png) |
 
 ### 4. テンプレート画像の作成（初回のみ）
 ```
