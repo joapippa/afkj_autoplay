@@ -3,3 +3,4 @@ debug_screens/
 screenshots/
 __pycache__/
 *.pyc
+.claude/

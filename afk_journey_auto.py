@@ -22,10 +22,12 @@ AFK Journey - 幻霊挑戦 自動操作スクリプト
 """
 
 import os
+import argparse
 import ctypes
 import pyautogui
 import cv2
 import numpy as np
+import random
 import time
 import sys
 import logging
@@ -65,7 +67,8 @@ WINDOW_TITLE = "AFK Journey"
 # テンプレート画像ファイルのパス（スクリプトと同じフォルダに置く）
 # ★ 下記のパスを実際の画像ファイルのパスに変更してください
 TEMPLATES = {
-    "幻霊挑戦_btn":     "templates/幻霊挑戦_btn.png",       # Step1: 「幻霊挑戦」ボタン
+    "幻霊挑戦_btn":     "templates/幻霊挑戦_btn.png",       # Step1: 「幻霊挑戦」ボタン（左下）
+    "挑戦_btn":         "templates/挑戦_btn.png",           # Step1: 「挑戦」ボタン（右下）
     "クリア編成_btn":   "templates/クリア編成_btn.png",     # Step2: 「クリア編成」ボタン
     "一括適用_btn":     "templates/一括適用_btn.png",       # Step3: 「一括適用」ボタン
     "オート挑戦_btn":   "templates/オート挑戦_btn.png",     # Step4: 「オート挑戦」ボタン
@@ -320,9 +323,10 @@ def activate_game_window():
         return False
 
 
-def run():
+def run(step1_mode: str):
     log.info("=" * 60)
     log.info("AFK Journey 幻霊挑戦 自動操作 開始")
+    log.info(f"Step1モード: {step1_mode}")
     log.info("停止: Ctrl+C  または  マウスを画面左上角へ移動")
     log.info("=" * 60)
 
@@ -335,14 +339,23 @@ def run():
         sys.exit(1)
     log.info("  操作開始！")
 
-    # ── Step1: 幻霊挑戦ボタンをクリック ──────────────────────────────────
-    log.info("[Step1] 幻霊挑戦ボタンを探しています...")
+    # ── Step1: モードに応じたボタンをクリック ────────────────────────────
+    if step1_mode == "random":
+        target_key = random.choice(["幻霊挑戦_btn", "挑戦_btn"])
+        log.info(f"[Step1] ランダム選択: {target_key}")
+    elif step1_mode == "挑戦":
+        target_key = "挑戦_btn"
+    else:
+        target_key = "幻霊挑戦_btn"
+
+    log.info(f"[Step1] {target_key} を探しています...")
     screen_data = screenshot_np()
-    if not click_template("幻霊挑戦_btn", screen_data, wait=WAIT_SCREEN_TRANS):
-        log.error("「幻霊挑戦」ボタンが見つかりません。")
+    if click_template(target_key, screen_data, wait=WAIT_SCREEN_TRANS):
+        log.info(f"[Step1] 完了（{target_key}）→ 幻霊先鋒ステージ画面へ遷移中...")
+    else:
+        log.error(f"「{target_key}」が見つかりません。")
         log.error("ゲームを「ステージ選択」画面にしてから再実行してください。")
         sys.exit(1)
-    log.info("[Step1] 完了 → 幻霊先鋒ステージ画面へ遷移中...")
 
     # ── Step2以降のメインループ ───────────────────────────────────────────
     while retry_count < MAX_RETRIES:
@@ -440,8 +453,17 @@ def run():
 # ─── エントリーポイント ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AFK Journey 幻霊挑戦 自動操作")
+    parser.add_argument(
+        "--step1",
+        choices=["幻霊挑戦", "挑戦", "random"],
+        default="幻霊挑戦",
+        help="Step1で押すボタンを選択 (デフォルト: 幻霊挑戦)",
+    )
+    args = parser.parse_args()
+
     try:
-        run()
+        run(step1_mode=args.step1)
     except KeyboardInterrupt:
         log.info("\n[停止] ユーザーによる中断 (Ctrl+C)")
     except pyautogui.FailSafeException:
