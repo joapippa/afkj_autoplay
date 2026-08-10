@@ -1,6 +1,8 @@
 *.log
 debug_screens/
 screenshots/
+# 旧PC・旧バージョンで使っていた素材の退避先（履歴には残っている）
+templates/_旧版/
 __pycache__/
 *.pyc
 .claude/
