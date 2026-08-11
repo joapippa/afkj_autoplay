@@ -390,11 +390,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument(
         "--attempts",
-        default="3,2",
+        default="2,1,1",
         metavar="X,Y",
         help=(
-            "各クリア編成での挑戦回数。3,2 なら1番目の編成で3回、"
-            "それでも勝てなければ2番目の編成で2回試して諦める (既定: 3,2)"
+            "各クリア編成での挑戦回数。2,1,1 なら1番目の編成で2回、"
+            "それでも勝てなければ2番目・3番目で1回ずつ試して諦める (既定: 2,1,1)"
         ),
     )
     p_run.add_argument(

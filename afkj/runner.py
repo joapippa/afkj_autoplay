@@ -86,9 +86,10 @@ class RunConfig:
 
     # 回す系統とその順番。前のものを限界までやってから次へ移る。
     mode_order: tuple[str, ...] = st.DEFAULT_MODE_ORDER
-    # 各クリア編成での挑戦回数。(3, 2) なら1番目の編成で3回、
-    # それでも勝てなければ2番目の編成で2回試し、そこで諦める。
-    formation_attempts: tuple[int, ...] = (3, 2)
+    # 各クリア編成での挑戦回数。(2, 1, 1) なら1番目の編成で2回、
+    # それでも勝てなければ2番目・3番目で1回ずつ試し、そこで諦める。
+    # 深く粘るより広く浅く（README「値の決め方」参照）。
+    formation_attempts: tuple[int, ...] = (2, 1, 1)
     poll_interval: float = 1.2  # 通常時の判定間隔（秒）
     battle_interval: float = 3.0  # 戦闘中の判定間隔（秒）
     after_click: float = 1.6  # クリック後に画面が変わるのを待つ時間（秒）
@@ -234,6 +235,8 @@ class Runner:
         # 看板が写っていたコマ / 写っていなかったコマの数（集計が合わないときの手掛かり）
         self._stage_present = 0
         self._stage_absent = 0
+        # 変化を見つけたが、次のコマで裏が取れずに見送った回数
+        self._stage_rejected = 0
 
     # ── 準備 ──────────────────────────────────────────────────────────────
 
@@ -825,6 +828,37 @@ class Runner:
             log.debug("看板ステータス: 基準を取得 (通算 %d回)", self._stage_present)
             return
 
+        # ── 変化を見つけたら、次のコマで裏を取ってから数える ──────────
+        # 1コマの変化だけで数えると、看板が描き変わる途中のコマを1回、
+        # 描き切ったコマをもう1回と、1回の進行を2回数えてしまう。
+        # 実測でもちょうどそのくらい多い:
+        #     集計画面の進捗 77 → 165（＝88ステージ）に対して 154回
+        #     別の周回では「合計4ステージクリア」に対して 9回
+        # そこで「同じ新しい看板が2コマ続いたら1回」に変える。
+        if self._stage_pending is not None:
+            settled = _correlation(self._stage_pending, sample)
+            if settled >= st.STAGE_SAME_CORRELATION:
+                # 同じ看板が2コマ続いた＝描き切っている。ここで1回数える。
+                self._stage_pending = None
+                self._stage_ref = sample
+                self.stats.mode(self._mode).victories += 1
+                log.info("ステージが進みました (2コマ連続で確認 相関 %.3f) → 通算: %s",
+                         settled, self.stats.summary())
+                return
+
+            if _correlation(self._stage_ref, sample) >= st.STAGE_SAME_CORRELATION:
+                # 元の看板に戻った＝ちらつきだった。数えない。
+                self._stage_pending = None
+                self._stage_rejected += 1
+                log.debug("看板ステータス: 変化が続かなかったので見送り (通算 %d回)",
+                          self._stage_rejected)
+                return
+
+            # まだ移り変わっている途中。今のコマを基準にもう1コマ待つ。
+            self._stage_pending = sample
+            log.debug("看板ステータス: まだ変化の途中 (相関 %.3f)", settled)
+            return
+
         score = _correlation(self._stage_ref, sample)
         log.debug("看板ステータス: 基準との相関 %.3f (しきい値 %.2f)",
                   score, st.STAGE_SAME_CORRELATION)
@@ -832,19 +866,14 @@ class Runner:
         if score >= st.STAGE_SAME_CORRELATION:
             return  # 同じステージのまま
 
-        # 看板が変わった＝ステージが進んだ。
-        # 看板が写っているコマ同士だけを比べているので、
-        # 同じステージなら相関はきわめて高くなる（実測 0.97）。
-        # そのため1回の変化で判断してよい。
         # ★ ここでの計上は周回の制御に使わない（表示だけ）。
-        #   実走で、集計画面が「合計4ステージクリア（54→58）」と出た周回で
-        #   ここは 9回 数えていた。この過大計上を「ステージを進めた」根拠に
-        #   混ぜると、同じステージに負け続けているのに挑戦回数が数え直しに
-        #   なり、いつまでも1番目のクリア編成で粘って諦めなくなる。
-        #   根拠は集計画面と勝利画面だけに絞っている（_note_progress の呼び先）。
-        self.stats.mode(self._mode).victories += 1
-        self._stage_ref = sample
-        log.info("ステージが進みました (相関 %.3f) → 通算: %s", score, self.stats.summary())
+        #   過大計上を「ステージを進めた」根拠に混ぜると、同じステージに
+        #   負け続けているのに挑戦回数が数え直しになり、いつまでも1番目の
+        #   クリア編成で粘って諦めなくなる。根拠は集計画面と勝利画面だけに
+        #   絞っている（_note_progress の呼び先）。
+        self._stage_pending = sample
+        log.debug("看板ステータス: 変わったかもしれない (相関 %.3f)。次のコマで確かめます",
+                  score)
 
     def _stage_label(self, frame: Frame) -> np.ndarray | None:
         """ステージ看板の領域を切り出す。看板が出ていなければ None。
@@ -881,7 +910,8 @@ class Runner:
         rate = self._stage_present / total
         return (
             f"看板の観測: 写っていた {self._stage_present}回 / "
-            f"写っていなかった {self._stage_absent}回 (観測率 {rate:.0%})"
+            f"写っていなかった {self._stage_absent}回 (観測率 {rate:.0%}) / "
+            f"裏が取れず見送った変化 {self._stage_rejected}回"
         )
 
     # ── 操作の実行 ────────────────────────────────────────────────────────
