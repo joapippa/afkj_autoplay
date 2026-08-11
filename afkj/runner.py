@@ -9,6 +9,27 @@
     - 画面遷移が遅れた        → 遷移するまで待ってから進む
     - ゲームが再起動された    → ウィンドウを取り直して続行
 
+周回の方針（「限界まで頑張り切る」）
+------------------------------------
+先鋒ステージは幻霊とシーズンの2系統があり、進捗は独立している。
+1つの系統について、こう粘る:
+
+    1番目のクリア編成で X回 挑む
+      → それでも負けるなら 2番目のクリア編成で Y回
+        → 設定した編成をすべて使い切ったら、その系統は諦めて次の系統へ
+          → どちらも諦めたら実行終了
+
+ステージを1つでも進めていたら、負けた相手は別の（より強い）ステージなので
+1番目のクリア編成から数え直す。進めたかどうかは次の2つを観測できたかで
+判断する（推測ではなく観測に基づくよう、根拠をログに残す）。
+
+    - オート戦闘終了（集計）画面 … 1つ以上クリアしたときだけ出る
+    - 戦闘勝利の画面
+
+勝利数の計上に使っているステージ看板の変化は、根拠に含めない。
+過大に数えることが実測で分かっており（集計画面が4クリアと出た周回で9回）、
+誤って「進めた」と判断すると同じ編成で永久に粘ってしまう。
+
 停止方法:
     Ctrl+C / F10 キー / マウスを画面左上角へ移動
 """
@@ -63,13 +84,20 @@ def _correlation(a: np.ndarray, b: np.ndarray) -> float:
 class RunConfig:
     """実行時の各種設定。"""
 
-    entry: str = "幻霊挑戦"  # 幻霊挑戦 / 挑戦 / random
+    # 回す系統とその順番。前のものを限界までやってから次へ移る。
+    mode_order: tuple[str, ...] = st.DEFAULT_MODE_ORDER
+    # 各クリア編成での挑戦回数。(3, 2) なら1番目の編成で3回、
+    # それでも勝てなければ2番目の編成で2回試し、そこで諦める。
+    formation_attempts: tuple[int, ...] = (3, 2)
     poll_interval: float = 1.2  # 通常時の判定間隔（秒）
     battle_interval: float = 3.0  # 戦闘中の判定間隔（秒）
     after_click: float = 1.6  # クリック後に画面が変わるのを待つ時間（秒）
     max_battles: int = 0  # 0 なら無制限
     max_runtime: float = 0.0  # 0 なら無制限（秒）
     stuck_seconds: float = 25.0  # 同じ画面が続いたら手を打つまでの時間
+    # 諦めてからステージ選択に戻れないまま経った時間の上限（秒）。
+    # ← が押せない画面に閉じ込められて、黙って回り続けるのを防ぐ。
+    give_up_timeout: float = 90.0
     unknown_limit: int = 40  # 不明状態が連続してよい回数
     dry_run: bool = False  # 判定だけしてクリックしない
     record: bool = False  # 状態が変わるたびに画面を保存する（検証用）
@@ -77,15 +105,36 @@ class RunConfig:
 
 
 @dataclass
-class Stats:
-    """実行結果の集計。"""
+class ModeStats:
+    """1つの系統（幻霊 / シーズン）ごとの集計。"""
 
-    started_at: float = field(default_factory=time.time)
     victories: int = 0
     defeats: int = 0
+    given_up: bool = False
+    give_up_reason: str = ""
+
+
+@dataclass
+class Stats:
+    """実行結果の集計。系統ごとに分けて持つ。"""
+
+    started_at: float = field(default_factory=time.time)
     clicks: int = 0
     recoveries: int = 0
     unknown_frames: int = 0
+    # 系統キー → その系統の成績。最初に触れた順で並ぶ。
+    modes: dict[str, ModeStats] = field(default_factory=dict)
+
+    def mode(self, key: str) -> ModeStats:
+        return self.modes.setdefault(key, ModeStats())
+
+    @property
+    def victories(self) -> int:
+        return sum(m.victories for m in self.modes.values())
+
+    @property
+    def defeats(self) -> int:
+        return sum(m.defeats for m in self.modes.values())
 
     @property
     def battles(self) -> int:
@@ -103,6 +152,18 @@ class Stats:
             f"クリック {self.clicks}回 / 自動復帰 {self.recoveries}回"
         )
 
+    def mode_report(self) -> list[str]:
+        """系統ごとの内訳。どちらをどこまで粘ったかを残す。"""
+        lines = []
+        for key, s in self.modes.items():
+            spec = st.MODES_BY_KEY.get(key)
+            label = spec.label if spec else key
+            state = f"諦めた（{s.give_up_reason}）" if s.given_up else "まだ余力あり"
+            lines.append(
+                f"{label}: 勝ち {s.victories} 負け {s.defeats} / {state}"
+            )
+        return lines or ["系統ごとの記録なし（戦闘に入りませんでした）"]
+
 
 class StopReason:
     USER = "ユーザーによる停止"
@@ -111,6 +172,8 @@ class StopReason:
     MAX_RUNTIME = "指定した実行時間に到達"
     LOST_WINDOW = "ゲームウィンドウを見失った"
     TOO_MANY_UNKNOWN = "画面を判定できない状態が続いた"
+    ALL_MODES_DONE = "すべての系統を限界まで回し切った"
+    GIVE_UP_STUCK = "諦めたあとステージ選択へ戻れなかった"
 
 
 # ─── 実行本体 ────────────────────────────────────────────────────────────────
@@ -131,6 +194,31 @@ class Runner:
         # 次に押すボタンが変わるため、これを覚えておく必要がある。
         self.formation_applied = False
 
+        # ── 系統（幻霊 / シーズン）の進行管理 ──────────────────────────
+        # 今どちらを回しているか。ステージ選択画面でボタンを押し分ける。
+        self._mode: str = config.mode_order[0] if config.mode_order else st.PHANTOM
+        # 限界まで粘って諦めた系統。以降は回さない。
+        self._exhausted: set[str] = set()
+        # 諦めた直後で、ステージ選択へ戻る途中かどうか。
+        self._giving_up = False
+        self._giving_up_since = 0.0
+
+        # ── クリア編成の使い分け ────────────────────────────────────────
+        # index 番目のクリア編成で formation_attempts[index] 回まで挑む。
+        self._formation_index = 0
+        self._attempts = 0
+        # このステージで1つでも先へ進めたか（進めていれば編成を数え直す）。
+        self._progressed = False
+        self._progress_evidence = ""
+        # 前回数えた敗北のあと、戦闘を観測したか。
+        # 敗北画面 → 一瞬の判定不能 → 敗北画面 という揺れがあり
+        # （記録にも auto_battle_end → unknown → defeat の並びがある）、
+        # これを2回の敗北として数えると挑戦回数を余計に消費してしまう。
+        self._battle_observed = True
+        self._last_defeat_at = 0.0
+        # 今開いているポップアップで「>」を押した回数。
+        self._arrow_presses = 0
+
         # 同じ画面に留まっているかの検出用
         self._last_state_key: str | None = None
         self._state_changed: bool = False
@@ -148,6 +236,16 @@ class Runner:
         self._stage_absent = 0
 
     # ── 準備 ──────────────────────────────────────────────────────────────
+
+    def check_action_templates(self) -> None:
+        """操作に使うテンプレートの欠けを、何ができなくなるかとあわせて知らせる。
+
+        状態判定用のテンプレート（states.py の detect）は _enabled_states が
+        面倒を見るが、押すボタンのほうは判定に出てこないので気づけない。
+        """
+        for name, effect in st.OPTIONAL_ACTION_TEMPLATES.items():
+            if name not in self.store.templates:
+                log.warning("テンプレート『%s』が未登録です → %s", name, effect)
 
     def _enabled_states(self) -> list[st.StateSpec]:
         enabled: list[st.StateSpec] = []
@@ -170,10 +268,12 @@ class Runner:
     def loop(self) -> str:
         """停止するまで回し続ける。停止理由を返す。"""
         log.info("=" * 60)
-        log.info("自動操作 開始  (エントリー: %s%s)", self.config.entry,
-                 " / 判定のみ・クリックしません" if self.config.dry_run else "")
+        log.info("自動操作 開始%s", " / 判定のみ・クリックしません" if self.config.dry_run else "")
+        log.info("回す順番: %s", " → ".join(self._mode_labels()))
+        log.info("各ステージの粘り方: %s", self._attempts_plan_text())
         log.info("停止: Ctrl+C / F10 / マウスを画面左上角へ")
         log.info("=" * 60)
+        self.check_action_templates()
 
         while True:
             reason = self._check_stop_conditions()
@@ -200,6 +300,17 @@ class Runner:
             self._unknown_streak = 0
             self._act(state, match, screen_gray, rect)
 
+    def _mode_labels(self) -> list[str]:
+        return [
+            st.MODES_BY_KEY[k].label for k in self.config.mode_order if k in st.MODES_BY_KEY
+        ]
+
+    def _attempts_plan_text(self) -> str:
+        return " → ".join(
+            f"{i + 1}番目のクリア編成で{n}回"
+            for i, n in enumerate(self.config.formation_attempts)
+        ) + " → 諦めて次の系統へ"
+
     def _check_stop_conditions(self) -> str | None:
         if win.is_key_down(win.VK_F10):
             return StopReason.USER
@@ -211,6 +322,19 @@ class Runner:
             return StopReason.MAX_RUNTIME
         if self._unknown_streak >= self.config.unknown_limit:
             return StopReason.TOO_MANY_UNKNOWN
+        if self._pick_mode() is None:
+            return StopReason.ALL_MODES_DONE
+        if (
+            self._giving_up
+            and self.config.give_up_timeout
+            and time.time() - self._giving_up_since > self.config.give_up_timeout
+        ):
+            # ← が押せない画面に閉じ込められている。黙って回り続けない。
+            log.warning(
+                "諦めてから %.0f秒 たってもステージ選択へ戻れませんでした",
+                self.config.give_up_timeout,
+            )
+            return StopReason.GIVE_UP_STUCK
         return None
 
     def _capture(self) -> tuple[Frame, win.WindowRect] | None:
@@ -335,21 +459,104 @@ class Runner:
         handler(state, match, screen_gray, rect)
 
     def _on_stage_select(self, state, match, screen_gray, rect) -> None:
-        candidates = self._entry_candidates()
-        log.info("[%s] エントリーボタンを押します", state.label)
+        """ステージ選択画面。今回そうする系統のボタンだけを押す。
+
+        ★ ここでボタンをフォールバックさせてはいけない。「幻霊挑戦」が
+          見つからないときに「挑戦」を押すと、別系統（シーズン先鋒）を
+          回してしまい、粘り方の管理も勝敗の内訳もずれる。
+          見つからないなら押さずに、次の周回で押し直す。
+        """
+        mode = self._pick_mode()
+        if mode is None:
+            return  # ループ先頭の停止判定で止まる
+
+        if mode != self._mode:
+            log.info(
+                "[%s] %s は諦めたので %s に移ります",
+                state.label, st.MODES_BY_KEY[self._mode].label, st.MODES_BY_KEY[mode].label,
+            )
+            self._mode = mode
+
+        self._giving_up = False
         self.formation_applied = False
-        self._click_first_available(candidates, screen_gray, rect)
+        self._start_new_stage("ステージ選択に戻った")
 
-    def _entry_candidates(self) -> list[str]:
-        import random
+        spec = st.MODES_BY_KEY[mode]
+        self.stats.mode(mode)  # 一度も勝ち負けしなくても内訳に出るように
+        log.info("[%s] %s へ入ります（%s）", state.label, spec.label, spec.entry_template)
+        if not self._click_template(spec.entry_template, screen_gray, rect):
+            log.warning("  %s が見つかりません（別系統のボタンは押しません）", spec.entry_template)
+            self._escalate(rect)
 
-        if self.config.entry == "random":
-            options = ["幻霊挑戦_btn", "挑戦_btn"]
-            random.shuffle(options)
-            return options
-        if self.config.entry == "挑戦":
-            return ["挑戦_btn", "幻霊挑戦_btn"]
-        return ["幻霊挑戦_btn", "挑戦_btn"]
+    # ── 系統の切り替え ────────────────────────────────────────────────────
+
+    def _pick_mode(self) -> str | None:
+        """まだ諦めていない系統のうち、指定順で先にあるもの。無ければ None。"""
+        for key in self.config.mode_order:
+            if key not in self._exhausted:
+                return key
+        return None
+
+    def _give_up_mode(self, reason: str) -> None:
+        """今の系統を諦める。ステージ選択へ戻って次の系統へ移る。"""
+        mode = self._mode
+        if mode in self._exhausted:
+            return
+        self._exhausted.add(mode)
+        stats = self.stats.mode(mode)
+        stats.given_up = True
+        stats.give_up_reason = reason
+        label = st.MODES_BY_KEY[mode].label
+        log.info("★ %s はここまで（%s）", label, reason)
+
+        if "戻る_btn" not in self.store.templates:
+            # ← が押せないとステージ選択へ戻れない。当てずっぽうにタップすると
+            # 編成画面では「戦闘」を押してしまう位置なので、触らずに終了する。
+            log.warning(
+                "戻る_btn が未登録のためステージ選択へ戻れません。実行を終了します"
+            )
+            self._exhausted.update(self.config.mode_order)
+            return
+
+        self._giving_up = True
+        self._giving_up_since = time.time()
+        remaining = self._pick_mode()
+        if remaining is None:
+            log.info("★ すべての系統を回し切りました。ステージ選択へ戻って終了します")
+        else:
+            log.info("★ 次は %s を回します", st.MODES_BY_KEY[remaining].label)
+
+    # ── クリア編成の使い分け ──────────────────────────────────────────────
+
+    def _start_new_stage(self, reason: str) -> None:
+        """このステージの粘り方を最初から数え直す。"""
+        if self._formation_index or self._attempts:
+            log.debug("粘り方をリセット（%s）", reason)
+        self._formation_index = 0
+        self._attempts = 0
+        self._progressed = False
+        self._progress_evidence = ""
+        self._arrow_presses = 0
+        # 系統を移ると看板の文字そのものが変わる（幻霊 / シーズン）。
+        # 前の看板を基準に残すと、切り替わりを1ステージ進んだと数えてしまう。
+        self._reset_stage_tracking()
+
+    def _note_progress(self, evidence: str) -> None:
+        """ステージを進めた証拠を記録する。
+
+        呼ぶのは信頼できる観測だけ（オート戦闘終了の集計画面と勝利画面）。
+        看板の変化による勝利数の計上は過大なので、ここには入れない。
+        """
+        if not self._progressed:
+            log.debug("ステージを進めた証拠: %s", evidence)
+        self._progressed = True
+        self._progress_evidence = evidence
+
+    def _allowed_attempts(self) -> int:
+        plan = self.config.formation_attempts
+        if self._formation_index < len(plan):
+            return max(1, plan[self._formation_index])
+        return 0
 
     def _on_formation(self, state, match, screen_gray, rect) -> None:
         """編成画面。
@@ -364,6 +571,16 @@ class Runner:
         なお同じ画面で足踏みが続いた場合は、覚えている状態が実態と
         ずれている可能性があるので、もう一方のボタンも試す。
         """
+        if self._giving_up:
+            # 諦めたので ← でステージ選択へ戻る。
+            # ここで画面中央下をタップすると「戦闘」（手動戦闘）を
+            # 踏みかねないので、← が見つからないときは何もしない。
+            log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
+            if not self._click_template("戻る_btn", screen_gray, rect):
+                log.warning("  ← が見つかりません。少し待って押し直します")
+                time.sleep(self.config.poll_interval)
+            return
+
         if self._stuck_for() > self.config.stuck_seconds:
             self.formation_applied = not self.formation_applied
             self.stats.recoveries += 1
@@ -380,22 +597,58 @@ class Runner:
         self._click_first_available(order, screen_gray, rect)
 
     def _on_clear_formation_list(self, state, match, screen_gray, rect) -> None:
-        """おすすめ編成のポップアップ。
+        """クリア編成のポップアップ。
 
         一括適用を押したあともポップアップが残ることがあるので、
         一度押したあとは画面をタップして閉じにいく。押し続けて
         同じ場所で足踏みするのを防ぐ。
+
+        2番目以降のクリア編成を使うときは、右端の「>」を必要な回数だけ
+        押してから一括適用する。ポップアップを開き直すと1番目に戻る前提で、
+        開いてからの押した回数を数える（状態が変わった＝開き直したとみなす）。
+        1回の周回で1つずつ押すので、押した結果が画面に出てから次へ進む。
         """
+        if self._state_changed:
+            self._arrow_presses = 0
+
+        if self._giving_up:
+            log.info("[%s] 諦めたのでポップアップを閉じます", state.label)
+            self._tap_dismiss(rect)
+            return
+
         if self.formation_applied:
             log.info("[%s] 適用済み。ポップアップを閉じます", state.label)
             self._tap_dismiss(rect)
             return
 
-        log.info("[%s] 一括適用を押します", state.label)
-        if self._click_first_available(["一括適用_btn"], screen_gray, rect):
+        if self._arrow_presses < self._formation_index:
+            log.info(
+                "[%s] %d番目のクリア編成へ送ります（> を %d/%d回）",
+                state.label, self._formation_index + 1,
+                self._arrow_presses + 1, self._formation_index,
+            )
+            if self._click_template("次の編成_btn", screen_gray, rect):
+                self._arrow_presses += 1
+            else:
+                # 「>」が無い＝これ以上クリア編成が無い。ここが本当の限界。
+                log.info("  > が見つかりません。これ以上のクリア編成はありません")
+                self._give_up_mode(f"クリア編成が{self._formation_index}個で尽きた")
+            return
+
+        log.info(
+            "[%s] %d番目のクリア編成を一括適用します（この編成で %d/%d回目）",
+            state.label, self._formation_index + 1,
+            self._attempts + 1, self._allowed_attempts(),
+        )
+        if self._click_template("一括適用_btn", screen_gray, rect):
             self.formation_applied = True
+        else:
+            log.warning("  一括適用が見つかりません")
+            self._escalate(rect)
 
     def _on_in_battle(self, state, match, screen_gray, rect) -> None:
+        # 「前回の敗北のあとに戦った」ことの目印。敗北を二重に数えないために使う。
+        self._battle_observed = True
         elapsed = int(self._stuck_for())
         frozen = time.time() - self._frozen_since
 
@@ -417,18 +670,96 @@ class Runner:
 
     def _on_auto_battle_end(self, state, match, screen_gray, rect) -> None:
         # この画面はどこをタップしても閉じる。閉じると敗北画面へ進む。
+        #
+        # この集計画面は「1つ以上クリアしてから途切れた」ときだけ出る
+        # （一度も勝てずに負けたときは出ない）。つまりこの画面が見えた
+        # ことが、ステージを進めた証拠になる。
         log.info("[%s] タップして閉じます", state.label)
+        self._note_progress("オート戦闘終了（集計）画面を観測")
         self.formation_applied = False
         self._reset_stage_tracking()
         self._tap_dismiss(rect)
 
     def _on_defeat(self, state, match, screen_gray, rect) -> None:
-        self._count_defeat()
-        log.info("[%s] もう一度を押して再挑戦します", state.label)
+        if self._state_changed:
+            # 敗北画面は数秒表示され続けるので、切り替わった最初の1回だけ
+            # 数えて、粘り方も1回だけ進める。
+            self._register_defeat()
+
         self.formation_applied = False
         self._reset_stage_tracking()
-        if not self._click_first_available(["もう一度_btn"], screen_gray, rect):
-            self._tap_dismiss(rect)
+
+        if self._giving_up:
+            log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
+            if not self._click_template("戻る_btn", screen_gray, rect):
+                log.warning("  ← が見つかりません。少し待って押し直します")
+                time.sleep(self.config.poll_interval)
+            return
+
+        log.info(
+            "[%s] もう一度を押して再挑戦します（%d番目のクリア編成で %d/%d回目）",
+            state.label, self._formation_index + 1,
+            self._attempts + 1, self._allowed_attempts(),
+        )
+        if not self._click_template("もう一度_btn", screen_gray, rect):
+            log.warning("  もう一度が見つかりません")
+            self._escalate(rect)
+
+    def _register_defeat(self) -> None:
+        """負けた1回を数え、次にどのクリア編成で挑むかを決める。
+
+        ステージを進めていたなら、負けた相手は前と別のステージなので
+        1番目のクリア編成から数え直す。進めていなければ同じステージに
+        負け続けているということなので、回数を使い切ったら次の編成へ移り、
+        編成も使い切ったらこの系統は諦める。
+        """
+        # 同じ敗北を二重に数えない。ただし「戦闘を観測できなかった」だけを
+        # 根拠に見送ると、戦闘の判定をたまたま撮り逃したときに回数が
+        # 増えなくなり、同じ編成で永久に粘ってしまう。時間でも見る。
+        since = time.time() - self._last_defeat_at
+        if not self._battle_observed and since < 25.0:
+            log.info(
+                "  この敗北は %.0f秒前と同じものとみて数えません"
+                "（戦闘を観測していないため）", since,
+            )
+            return
+        self._battle_observed = False
+        self._last_defeat_at = time.time()
+
+        self.stats.mode(self._mode).defeats += 1
+        log.info("  → 通算: %s", self.stats.summary())
+
+        if self._progressed:
+            log.info(
+                "  ステージを進めていたので1番目のクリア編成から数え直します（根拠: %s）",
+                self._progress_evidence,
+            )
+            self._start_new_stage("ステージが進んでいた")
+            return
+
+        self._attempts += 1
+        allowed = self._allowed_attempts()
+        if self._attempts < allowed:
+            log.info(
+                "  同じステージに負けました。%d番目のクリア編成で %d/%d回目を試します",
+                self._formation_index + 1, self._attempts + 1, allowed,
+            )
+            return
+
+        # この編成では回数を使い切った。次の編成へ。
+        self._formation_index += 1
+        self._attempts = 0
+        self._arrow_presses = 0
+        plan = self.config.formation_attempts
+        if self._formation_index >= len(plan):
+            self._give_up_mode(
+                "クリア編成 " + "＋".join(f"{n}回" for n in plan) + " を試し切った"
+            )
+            return
+        log.info(
+            "  %d番目のクリア編成では勝てませんでした。%d番目の編成で %d回 試します",
+            self._formation_index, self._formation_index + 1, self._allowed_attempts(),
+        )
 
     def _on_victory(self, state, match, screen_gray, rect) -> None:
         """勝利画面。
@@ -441,6 +772,10 @@ class Runner:
         """
         # 勝った回数はここでは数えない。ステージ看板の変化で数えている
         # （勝利画面は表示が短く、判定の間隔によっては見逃すため）。
+        # ただし「進めたかどうか」の判断には使う。数え落としても
+        # 集計画面・看板の変化のどれかを観測できれば足りる。
+        self._note_progress("戦闘勝利の画面を観測")
+
         if self._auto_run_active(screen_gray):
             log.info("[%s] オート周回が継続中。自動で次へ進むのを待ちます", state.label)
             time.sleep(self.config.poll_interval)
@@ -448,7 +783,8 @@ class Runner:
 
         log.info("[%s] オート周回は終了。次へ進みます", state.label)
         self.formation_applied = False
-        if not self._click_first_available(self._entry_candidates(), screen_gray, rect):
+        entry = st.MODES_BY_KEY[self._mode].entry_template
+        if not self._click_template(entry, screen_gray, rect):
             self._tap_dismiss(rect)
 
     def _auto_run_active(self, screen_gray: np.ndarray) -> bool:
@@ -461,17 +797,6 @@ class Runner:
         if "オート挑戦中" not in self.store.templates:
             return False
         return self.store.find("オート挑戦中", screen_gray) is not None
-
-    def _count_defeat(self) -> None:
-        """敗北を数える。
-
-        敗北画面は数秒表示され続けるため、状態が切り替わった最初の1回だけ
-        数える。そうしないと同じ戦闘を何度も数えてしまう。
-        """
-        if not self._state_changed:
-            return
-        self.stats.defeats += 1
-        log.info("  → 通算: %s", self.stats.summary())
 
     # ── ステージ進行の追跡（勝利数の計上）────────────────────────────────
 
@@ -511,7 +836,13 @@ class Runner:
         # 看板が写っているコマ同士だけを比べているので、
         # 同じステージなら相関はきわめて高くなる（実測 0.97）。
         # そのため1回の変化で判断してよい。
-        self.stats.victories += 1
+        # ★ ここでの計上は周回の制御に使わない（表示だけ）。
+        #   実走で、集計画面が「合計4ステージクリア（54→58）」と出た周回で
+        #   ここは 9回 数えていた。この過大計上を「ステージを進めた」根拠に
+        #   混ぜると、同じステージに負け続けているのに挑戦回数が数え直しに
+        #   なり、いつまでも1番目のクリア編成で粘って諦めなくなる。
+        #   根拠は集計画面と勝利画面だけに絞っている（_note_progress の呼び先）。
+        self.stats.mode(self._mode).victories += 1
         self._stage_ref = sample
         log.info("ステージが進みました (相関 %.3f) → 通算: %s", score, self.stats.summary())
 
@@ -555,18 +886,34 @@ class Runner:
 
     # ── 操作の実行 ────────────────────────────────────────────────────────
 
+    def _click_template(
+        self, name: str, screen_gray: np.ndarray, rect: win.WindowRect
+    ) -> bool:
+        """1つのテンプレートを探してクリックする。見つからなければ False。
+
+        見つからなかったときにどうするかは呼び出し側で決める。
+        「押せなかったら待つ」で済む場面と、「押せない＝限界」と判断すべき
+        場面（クリア編成の『>』が無い）とがあるため。
+        """
+        if name not in self.store.templates:
+            return False
+        match = self.store.find(name, screen_gray)
+        if match is None:
+            return False
+        self._click_at(match.center, rect, label=name, score=match.score)
+        return True
+
     def _click_first_available(
         self, names: list[str], screen_gray: np.ndarray, rect: win.WindowRect
     ) -> bool:
-        """候補のうち最初に見つかったものをクリックする。"""
+        """候補のうち最初に見つかったものをクリックする。
+
+        ★ 系統（幻霊 / シーズン）のエントリーボタンには使わないこと。
+          押し分けが必要なので、候補を並べると別系統に入ってしまう。
+        """
         for name in names:
-            if name not in self.store.templates:
-                continue
-            match = self.store.find(name, screen_gray)
-            if match is None:
-                continue
-            self._click_at(match.center, rect, label=name, score=match.score)
-            return True
+            if self._click_template(name, screen_gray, rect):
+                return True
 
         log.warning("  押せるボタンが見つかりません (%s)", ", ".join(names))
         self._escalate(rect)

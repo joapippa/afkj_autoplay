@@ -243,10 +243,57 @@ def _warn_contradictions(matched: set[str]) -> None:
 # ─── run ─────────────────────────────────────────────────────────────────────
 
 
+def _parse_modes(text: str) -> tuple[str, ...] | None:
+    """`幻霊,シーズン` のような指定を系統キーの並びにする。
+
+    重複は最初の位置だけ残す。1つも取れなければ None。
+    """
+    from afkj import states as st
+
+    keys: list[str] = []
+    for raw in text.split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        spec = st.MODES_BY_CLI_NAME.get(name)
+        if spec is None:
+            return None
+        if spec.key not in keys:
+            keys.append(spec.key)
+    return tuple(keys) or None
+
+
+def _parse_attempts(text: str) -> tuple[int, ...] | None:
+    """`3,2` のような指定を、各クリア編成での挑戦回数にする。"""
+    values: list[int] = []
+    for raw in text.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if not item.isdigit() or int(item) < 1:
+            return None
+        values.append(int(item))
+    return tuple(values) or None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    from afkj import states as st
     from afkj import window as win
     from afkj.runner import RunConfig, Runner
     from afkj.vision import TemplateStore
+
+    mode_order = _parse_modes(args.modes)
+    if mode_order is None:
+        names = " / ".join(m.cli_name for m in st.MODES)
+        print(f"[エラー] --modes の指定が不正です: {args.modes}")
+        print(f"        使えるのは {names} をカンマで並べたもの（例: 幻霊,シーズン）")
+        return 1
+
+    attempts = _parse_attempts(args.attempts)
+    if attempts is None:
+        print(f"[エラー] --attempts の指定が不正です: {args.attempts}")
+        print("        1以上の整数をカンマで並べてください（例: 3,2）")
+        return 1
 
     store = TemplateStore(TEMPLATES_DIR)
     store.load()
@@ -270,7 +317,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     config = RunConfig(
-        entry=args.entry,
+        mode_order=mode_order,
+        formation_attempts=attempts,
         max_battles=args.max_battles,
         max_runtime=args.max_minutes * 60 if args.max_minutes else 0.0,
         dry_run=args.dry_run,
@@ -288,6 +336,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     print("=" * 64)
     print(f"  停止: {reason}")
     print(f"  {runner.stats.summary()}")
+    for line in runner.stats.mode_report():
+        print(f"  {line}")
     print(f"  {runner.stage_tracking_report()}")
     print("=" * 64)
     return 0
@@ -330,10 +380,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="自動操作を開始する")
     p_run.add_argument(
-        "--entry",
-        choices=["幻霊挑戦", "挑戦", "random"],
-        default="幻霊挑戦",
-        help="ステージ選択画面で押すボタン (既定: 幻霊挑戦)",
+        "--modes",
+        default="幻霊,シーズン",
+        metavar="幻霊,シーズン",
+        help=(
+            "回す先鋒ステージの系統とその順番。前のものを限界まで粘ってから"
+            "次へ移る (既定: 幻霊,シーズン。片方だけなら 幻霊 のように書く)"
+        ),
+    )
+    p_run.add_argument(
+        "--attempts",
+        default="3,2",
+        metavar="X,Y",
+        help=(
+            "各クリア編成での挑戦回数。3,2 なら1番目の編成で3回、"
+            "それでも勝てなければ2番目の編成で2回試して諦める (既定: 3,2)"
+        ),
     )
     p_run.add_argument(
         "--dry-run",
