@@ -26,9 +26,8 @@
     - オート戦闘終了（集計）画面 … 1つ以上クリアしたときだけ出る
     - 戦闘勝利の画面
 
-勝利数の計上に使っているステージ看板の変化は、根拠に含めない。
-過大に数えることが実測で分かっており（集計画面が4クリアと出た周回で9回）、
-誤って「進めた」と判断すると同じ編成で永久に粘ってしまう。
+クリアしたステージ数は自分では数えず、集計画面に出ている
+「先鋒ステージ進捗 161 ≫ 165」をそのまま読む（digits.py）。
 
 停止方法:
     Ctrl+C / F10 キー / マウスを画面左上角へ移動
@@ -44,6 +43,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import digits
 from . import states as st
 from . import window as win
 from .vision import Frame, TemplateStore, imwrite_unicode, to_gray
@@ -61,20 +61,6 @@ def _for_saving(frame: Frame) -> np.ndarray:
     if color is not None:
         return cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
     return frame.gray
-
-
-def _correlation(a: np.ndarray, b: np.ndarray) -> float:
-    """2つの切り出し画像の正規化相関（-1〜1）。
-
-    平均を引いてから比べるので、明るさの違いには左右されない。
-    背景の演出が多少動いても、同じ看板なら高い値になる。
-    """
-    if a.shape != b.shape:
-        return 0.0
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = float(np.sqrt((a * a).sum() * (b * b).sum()))
-    return float((a * b).sum() / denom) if denom else 0.0
 
 
 # ─── 設定 ────────────────────────────────────────────────────────────────────
@@ -125,6 +111,17 @@ class Stats:
     unknown_frames: int = 0
     # 系統キー → その系統の成績。最初に触れた順で並ぶ。
     modes: dict[str, ModeStats] = field(default_factory=dict)
+    # 集計画面で読んだ「先鋒ステージ進捗」。最初と最後、および読めた回数。
+    progress_first: int | None = None
+    progress_last: int | None = None
+    summaries_read: int = 0
+    summaries_unread: int = 0
+
+    def note_progress_numbers(self, before: int, after: int) -> None:
+        if self.progress_first is None:
+            self.progress_first = before
+        self.progress_last = after
+        self.summaries_read += 1
 
     def mode(self, key: str) -> ModeStats:
         return self.modes.setdefault(key, ModeStats())
@@ -164,6 +161,19 @@ class Stats:
                 f"{label}: 勝ち {s.victories} 負け {s.defeats} / {state}"
             )
         return lines or ["系統ごとの記録なし（戦闘に入りませんでした）"]
+
+    def progress_report(self) -> str:
+        """集計画面から読んだ進捗。ゲーム自身が出している数字。"""
+        total = self.summaries_read + self.summaries_unread
+        if not total:
+            return "先鋒ステージ進捗: 集計画面が出ませんでした（1ステージもクリアせず）"
+        read = f"集計画面 {total}回中 {self.summaries_read}回 読み取り"
+        if self.progress_first is None:
+            return f"先鋒ステージ進捗: 読み取れませんでした（{read}）"
+        return (
+            f"先鋒ステージ進捗: {self.progress_first} → {self.progress_last} "
+            f"(+{self.progress_last - self.progress_first}) / {read}"
+        )
 
 
 class StopReason:
@@ -229,14 +239,8 @@ class Runner:
         self._last_signature: bytes | None = None
         self._frozen_since: float = time.time()
 
-        # ステージ看板の見た目。変化したら1ステージ進んだと数える。
-        self._stage_ref: np.ndarray | None = None
-        self._stage_pending: np.ndarray | None = None
-        # 看板が写っていたコマ / 写っていなかったコマの数（集計が合わないときの手掛かり）
-        self._stage_present = 0
-        self._stage_absent = 0
-        # 変化を見つけたが、次のコマで裏が取れずに見送った回数
-        self._stage_rejected = 0
+        # 集計画面の「先鋒ステージ進捗」を読む係
+        self.digits = digits.DigitReader(store.directory / "digits")
 
     # ── 準備 ──────────────────────────────────────────────────────────────
 
@@ -294,7 +298,6 @@ class Runner:
             state, match = self._identify(screen_gray)
             self._track(state, screen_gray)
             self._record_transition(state, screen_gray)
-            self._track_stage_progress(state, screen_gray)
 
             if state is None:
                 self._handle_unknown(screen_gray, rect)
@@ -540,9 +543,6 @@ class Runner:
         self._progressed = False
         self._progress_evidence = ""
         self._arrow_presses = 0
-        # 系統を移ると看板の文字そのものが変わる（幻霊 / シーズン）。
-        # 前の看板を基準に残すと、切り替わりを1ステージ進んだと数えてしまう。
-        self._reset_stage_tracking()
 
     def _note_progress(self, evidence: str) -> None:
         """ステージを進めた証拠を記録する。
@@ -679,9 +679,33 @@ class Runner:
         # ことが、ステージを進めた証拠になる。
         log.info("[%s] タップして閉じます", state.label)
         self._note_progress("オート戦闘終了（集計）画面を観測")
+        if self._state_changed:
+            # クリア数はこの画面に出ている数字をそのまま読む。1画面につき1回。
+            self._read_progress(screen_gray)
         self.formation_applied = False
-        self._reset_stage_tracking()
         self._tap_dismiss(rect)
+
+    def _read_progress(self, screen_gray: Frame) -> None:
+        """集計画面の「先鋒ステージ進捗 A ≫ B」を読み、クリア数を計上する。"""
+        if not self.digits.available:
+            return
+        got = self.digits.read_progress(screen_gray.gray)
+        if got is None:
+            self.stats.summaries_unread += 1
+            log.info("  進捗の数字を読み取れませんでした（クリア数は数えません）")
+            return
+
+        before, after = got
+        cleared = after - before
+        if cleared < 0 or cleared > 100:
+            # 読めたつもりで見当違いの値なら採らない（演出が数字に重なるなど）
+            self.stats.summaries_unread += 1
+            log.warning("  進捗の数字が不自然です (%d → %d)。読み飛ばします", before, after)
+            return
+
+        self.stats.note_progress_numbers(before, after)
+        self.stats.mode(self._mode).victories += cleared
+        log.info("  先鋒ステージ進捗 %d → %d（%dステージクリア）", before, after, cleared)
 
     def _on_defeat(self, state, match, screen_gray, rect) -> None:
         if self._state_changed:
@@ -690,7 +714,6 @@ class Runner:
             self._register_defeat()
 
         self.formation_applied = False
-        self._reset_stage_tracking()
 
         if self._giving_up:
             log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
@@ -773,10 +796,10 @@ class Runner:
         周回が終わっている場合は結果パネルに『挑戦』ボタンが出るので、
         それを押して次へ進む。
         """
-        # 勝った回数はここでは数えない。ステージ看板の変化で数えている
-        # （勝利画面は表示が短く、判定の間隔によっては見逃すため）。
-        # ただし「進めたかどうか」の判断には使う。数え落としても
-        # 集計画面・看板の変化のどれかを観測できれば足りる。
+        # 勝った回数はここでは数えない（勝利画面は表示が短く、判定の間隔に
+        # よっては見逃すため。実測でも 88クリアの周回で8回しか見えていない）。
+        # クリア数は集計画面の数字を読む。ここで使うのは
+        # 「先へ進めたか」の判断だけで、見逃しても集計画面で拾える。
         self._note_progress("戦闘勝利の画面を観測")
 
         if self._auto_run_active(screen_gray):
@@ -802,117 +825,6 @@ class Runner:
         return self.store.find("オート挑戦中", screen_gray) is not None
 
     # ── ステージ進行の追跡（勝利数の計上）────────────────────────────────
-
-    def _track_stage_progress(self, state: st.StateSpec | None, frame: Frame) -> None:
-        """ステージの看板が変わったかを見て、勝った回数を数える。
-
-        ★ 未完成。実走では集計画面が「合計2/4ステージクリア」と表示した
-          周回で、ここでの計上が 0 だった。原因は切り分け中で、
-          戦闘中の判定タイミングで看板が写るコマを拾えていない疑いがある。
-          stage_tracking_report() の観測率で切り分けられるようにしてある。
-          周回の動作そのものには影響しない（表示される数値だけの問題）。
-        """
-        if state is None or state.key != st.IN_BATTLE:
-            return
-
-        sample = self._stage_label(frame)
-        if sample is None:
-            self._stage_absent += 1
-            log.debug("看板ステータス: 写っていない (通算 %d回)", self._stage_absent)
-            return
-
-        self._stage_present += 1
-
-        if self._stage_ref is None:
-            self._stage_ref = sample
-            log.debug("看板ステータス: 基準を取得 (通算 %d回)", self._stage_present)
-            return
-
-        # ── 変化を見つけたら、次のコマで裏を取ってから数える ──────────
-        # 1コマの変化だけで数えると、看板が描き変わる途中のコマを1回、
-        # 描き切ったコマをもう1回と、1回の進行を2回数えてしまう。
-        # 実測でもちょうどそのくらい多い:
-        #     集計画面の進捗 77 → 165（＝88ステージ）に対して 154回
-        #     別の周回では「合計4ステージクリア」に対して 9回
-        # そこで「同じ新しい看板が2コマ続いたら1回」に変える。
-        if self._stage_pending is not None:
-            settled = _correlation(self._stage_pending, sample)
-            if settled >= st.STAGE_SAME_CORRELATION:
-                # 同じ看板が2コマ続いた＝描き切っている。ここで1回数える。
-                self._stage_pending = None
-                self._stage_ref = sample
-                self.stats.mode(self._mode).victories += 1
-                log.info("ステージが進みました (2コマ連続で確認 相関 %.3f) → 通算: %s",
-                         settled, self.stats.summary())
-                return
-
-            if _correlation(self._stage_ref, sample) >= st.STAGE_SAME_CORRELATION:
-                # 元の看板に戻った＝ちらつきだった。数えない。
-                self._stage_pending = None
-                self._stage_rejected += 1
-                log.debug("看板ステータス: 変化が続かなかったので見送り (通算 %d回)",
-                          self._stage_rejected)
-                return
-
-            # まだ移り変わっている途中。今のコマを基準にもう1コマ待つ。
-            self._stage_pending = sample
-            log.debug("看板ステータス: まだ変化の途中 (相関 %.3f)", settled)
-            return
-
-        score = _correlation(self._stage_ref, sample)
-        log.debug("看板ステータス: 基準との相関 %.3f (しきい値 %.2f)",
-                  score, st.STAGE_SAME_CORRELATION)
-
-        if score >= st.STAGE_SAME_CORRELATION:
-            return  # 同じステージのまま
-
-        # ★ ここでの計上は周回の制御に使わない（表示だけ）。
-        #   過大計上を「ステージを進めた」根拠に混ぜると、同じステージに
-        #   負け続けているのに挑戦回数が数え直しになり、いつまでも1番目の
-        #   クリア編成で粘って諦めなくなる。根拠は集計画面と勝利画面だけに
-        #   絞っている（_note_progress の呼び先）。
-        self._stage_pending = sample
-        log.debug("看板ステータス: 変わったかもしれない (相関 %.3f)。次のコマで確かめます",
-                  score)
-
-    def _stage_label(self, frame: Frame) -> np.ndarray | None:
-        """ステージ看板の領域を切り出す。看板が出ていなければ None。
-
-        オート挑戦を押した直後の約2秒と、勝利後に次のステージへ移る間は
-        ロード画面や場面転換の演出になっていて看板が出ていない。
-        その状態のコマを比較に混ぜると、番号が変わったのか看板が消えたのか
-        区別がつかず、数え間違いの原因になる。
-        白い文字がどれだけあるかで、看板が出ているコマだけを選ぶ。
-        """
-        x1r, y1r, x2r, y2r = st.STAGE_LABEL_REGION
-        h, w = frame.gray.shape[:2]
-        x1, x2 = int(w * x1r), int(w * x2r)
-        y1, y2 = int(h * y1r), int(h * y2r)
-        if x2 - x1 < 8 or y2 - y1 < 4:
-            return None
-
-        crop = frame.gray[y1:y2, x1:x2]
-        text_ratio = float((crop > st.STAGE_LABEL_BRIGHTNESS).mean())
-        if text_ratio < st.STAGE_LABEL_MIN_TEXT_RATIO:
-            return None  # 看板が出ていない（ロード中・場面転換中）
-        return crop.astype(np.float32)
-
-    def _reset_stage_tracking(self) -> None:
-        """周回が途切れたら基準を捨てる（次の周回を新しく数え始める）。"""
-        self._stage_ref = None
-        self._stage_pending = None
-
-    def stage_tracking_report(self) -> str:
-        """看板をどれだけ観測できたかの内訳。集計が合わないときの手掛かり。"""
-        total = self._stage_present + self._stage_absent
-        if total == 0:
-            return "看板の観測: 戦闘中の判定が一度も行われませんでした"
-        rate = self._stage_present / total
-        return (
-            f"看板の観測: 写っていた {self._stage_present}回 / "
-            f"写っていなかった {self._stage_absent}回 (観測率 {rate:.0%}) / "
-            f"裏が取れず見送った変化 {self._stage_rejected}回"
-        )
 
     # ── 操作の実行 ────────────────────────────────────────────────────────
 

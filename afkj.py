@@ -338,7 +338,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  {runner.stats.summary()}")
     for line in runner.stats.mode_report():
         print(f"  {line}")
-    print(f"  {runner.stage_tracking_report()}")
+    print(f"  {runner.stats.progress_report()}")
     print("=" * 64)
     return 0
 
