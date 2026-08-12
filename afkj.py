@@ -24,6 +24,8 @@ DEBUG_DIR = ROOT / "debug_screens"
 
 WINDOW_TITLE = "AFK Journey"
 
+log = logging.getLogger(__name__)
+
 
 def setup_console_utf8() -> None:
     """コンソールを UTF-8 にする。
@@ -332,14 +334,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         reason = "ユーザーによる中断 (Ctrl+C)"
 
-    print()
-    print("=" * 64)
-    print(f"  停止: {reason}")
-    print(f"  {runner.stats.summary()}")
+    # print ではなく log で出す。afkj.log に残らないと、走らせたあとの
+    # 突き合わせでこの総括だけが失われるため。
+    log.info("=" * 60)
+    log.info("停止: %s", reason)
+    log.info("  %s", runner.stats.summary())
     for line in runner.stats.mode_report():
-        print(f"  {line}")
-    print(f"  {runner.stats.progress_report()}")
-    print("=" * 64)
+        log.info("  %s", line)
+    log.info("  %s", runner.stats.progress_report())
+    log.info("=" * 60)
     return 0
 
 
@@ -390,11 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument(
         "--attempts",
-        default="2,1,1",
+        default="3,2,1,1,1",
         metavar="X,Y",
         help=(
-            "各クリア編成での挑戦回数。2,1,1 なら1番目の編成で2回、"
-            "それでも勝てなければ2番目・3番目で1回ずつ試して諦める (既定: 2,1,1)"
+            "各クリア編成での挑戦回数。3,2,1,1,1 なら1番目の編成で3回、"
+            "2番目で2回、3〜5番目で1回ずつ試して諦める (既定: 3,2,1,1,1)"
         ),
     )
     p_run.add_argument(

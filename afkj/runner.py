@@ -72,10 +72,10 @@ class RunConfig:
 
     # 回す系統とその順番。前のものを限界までやってから次へ移る。
     mode_order: tuple[str, ...] = st.DEFAULT_MODE_ORDER
-    # 各クリア編成での挑戦回数。(2, 1, 1) なら1番目の編成で2回、
-    # それでも勝てなければ2番目・3番目で1回ずつ試し、そこで諦める。
+    # 各クリア編成での挑戦回数。(3, 2, 1, 1, 1) なら1番目の編成で3回、
+    # 2番目で2回、3〜5番目で1回ずつ試し、そこで諦める。
     # 深く粘るより広く浅く（README「値の決め方」参照）。
-    formation_attempts: tuple[int, ...] = (2, 1, 1)
+    formation_attempts: tuple[int, ...] = (3, 2, 1, 1, 1)
     poll_interval: float = 1.2  # 通常時の判定間隔（秒）
     battle_interval: float = 3.0  # 戦闘中の判定間隔（秒）
     after_click: float = 1.6  # クリック後に画面が変わるのを待つ時間（秒）
