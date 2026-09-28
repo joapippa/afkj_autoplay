@@ -54,6 +54,11 @@ log = logging.getLogger(__name__)
 # 優先度順に調べているので、より優先度の低い状態が結果を覆すことはない。
 CONFIDENT_SCORE = 0.93
 
+# ステージ選択で「今の系統のボタンが無く、別系統のボタンだけが見える」が
+# この回数続いたら、その系統はクリアし終えてボタンが消えたと判断する。
+# 1回で決めないのは、演出や一瞬の見落としで系統を捨てないため。
+ENTRY_ABSENT_FRAMES = 3
+
 
 def _for_saving(frame: Frame) -> np.ndarray:
     """保存用の画像。カラーがあればカラー（BGR）、なければ白黒。"""
@@ -99,6 +104,8 @@ class ModeStats:
     defeats: int = 0
     given_up: bool = False
     give_up_reason: str = ""
+    # ステージ選択にこの系統のボタンが無かった（クリアし終えて消えた）。
+    absent: bool = False
 
 
 @dataclass
@@ -156,7 +163,12 @@ class Stats:
         for key, s in self.modes.items():
             spec = st.MODES_BY_KEY.get(key)
             label = spec.label if spec else key
-            state = f"諦めた（{s.give_up_reason}）" if s.given_up else "まだ余力あり"
+            if s.absent:
+                state = "ステージ選択にボタンが無いため回さず（クリア済みとみなした）"
+            elif s.given_up:
+                state = f"諦めた（{s.give_up_reason}）"
+            else:
+                state = "まだ余力あり"
             lines.append(
                 f"{label}: 勝ち {s.victories} 負け {s.defeats} / {state}"
             )
@@ -213,6 +225,9 @@ class Runner:
         # 諦めた直後で、ステージ選択へ戻る途中かどうか。
         self._giving_up = False
         self._giving_up_since = 0.0
+        # ステージ選択で「今の系統のボタンは無いが、別系統のボタンは見える」
+        # が続いたフレーム数。系統をクリアし終えるとそのボタンは消える。
+        self._entry_absent_frames = 0
 
         # ── クリア編成の使い分け ────────────────────────────────────────
         # index 番目のクリア編成で formation_attempts[index] 回まで挑む。
@@ -433,6 +448,7 @@ class Runner:
             self._last_state_key = key
             self._state_since = time.time()
             self._escalation = 0
+            self._entry_absent_frames = 0
 
         # 画面が動いているか（戦闘中はアニメで常に変わる）
         signature = cv2.resize(screen_gray.work, (16, 16), interpolation=cv2.INTER_AREA).tobytes()
@@ -471,6 +487,11 @@ class Runner:
           見つからないときに「挑戦」を押すと、別系統（シーズン先鋒）を
           回してしまい、粘り方の管理も勝敗の内訳もずれる。
           見つからないなら押さずに、次の周回で押し直す。
+
+        ただし系統をクリアし終えるとそのボタンは画面から消え、残った系統の
+        「挑戦」だけが中央に1つ出る。「別系統のボタンは見えるのに、今の系統の
+        ボタンが無い」が ENTRY_ABSENT_FRAMES 回続いたら、その系統は無いものと
+        して次へ移る（押し直しても出てこないので、待つと永久に詰まる）。
         """
         mode = self._pick_mode()
         if mode is None:
@@ -478,7 +499,7 @@ class Runner:
 
         if mode != self._mode:
             log.info(
-                "[%s] %s は諦めたので %s に移ります",
+                "[%s] %s は終えたので %s に移ります",
                 state.label, st.MODES_BY_KEY[self._mode].label, st.MODES_BY_KEY[mode].label,
             )
             self._mode = mode
@@ -489,10 +510,35 @@ class Runner:
 
         spec = st.MODES_BY_KEY[mode]
         self.stats.mode(mode)  # 一度も勝ち負けしなくても内訳に出るように
-        log.info("[%s] %s へ入ります（%s）", state.label, spec.label, spec.entry_template)
-        if not self._click_template(spec.entry_template, screen_gray, rect):
+        entry = (
+            self.store.find(spec.entry_template, screen_gray)
+            if spec.entry_template in self.store.templates else None
+        )
+        if entry is not None:
+            log.info("[%s] %s へ入ります（%s）", state.label, spec.label, spec.entry_template)
+            self._entry_absent_frames = 0
+            self._click_at(entry.center, rect, label=spec.entry_template, score=entry.score)
+            return
+
+        others = self._visible_other_entries(mode, screen_gray)
+        if not others:
             log.warning("  %s が見つかりません（別系統のボタンは押しません）", spec.entry_template)
             self._escalate(rect)
+            return
+
+        # 別系統のボタンだけが見えている。この系統はクリアし終えて消えた可能性が高い。
+        # 一瞬の見落としで系統を捨てないよう、続けて確認できてから判断する。
+        self._entry_absent_frames += 1
+        seen = ", ".join(f"{m.name}={m.score:.3f}" for m in others)
+        log.info(
+            "[%s] %s が無く、%s だけが見えます（確認 %d/%d）",
+            state.label, spec.entry_template, seen,
+            self._entry_absent_frames, ENTRY_ABSENT_FRAMES,
+        )
+        if self._entry_absent_frames >= ENTRY_ABSENT_FRAMES:
+            self._skip_absent_mode(mode)
+        else:
+            time.sleep(self.config.poll_interval)
 
     # ── 系統の切り替え ────────────────────────────────────────────────────
 
@@ -502,6 +548,34 @@ class Runner:
             if key not in self._exhausted:
                 return key
         return None
+
+    def _visible_other_entries(self, mode: str, screen_gray: np.ndarray) -> list:
+        """ステージ選択画面に見えている、今の系統以外のエントリーボタン。"""
+        found = []
+        for spec in st.MODES:
+            if spec.key == mode or spec.entry_template not in self.store.templates:
+                continue
+            match = self.store.find(spec.entry_template, screen_gray)
+            if match is not None:
+                found.append(match)
+        return found
+
+    def _skip_absent_mode(self, mode: str) -> None:
+        """ステージ選択にボタンが無い系統を飛ばす。
+
+        諦める（_give_up_mode）のと違い、すでにステージ選択にいるので
+        ← で戻る必要はない。次のフレームで残りの系統のボタンを押す。
+        """
+        self._entry_absent_frames = 0
+        self._exhausted.add(mode)
+        self.stats.mode(mode).absent = True
+        log.info(
+            "★ %s のボタンがありません（クリア済みとみなして飛ばします）",
+            st.MODES_BY_KEY[mode].label,
+        )
+        remaining = self._pick_mode()
+        if remaining is not None:
+            log.info("★ 次は %s を回します", st.MODES_BY_KEY[remaining].label)
 
     def _give_up_mode(self, reason: str) -> None:
         """今の系統を諦める。ステージ選択へ戻って次の系統へ移る。"""
