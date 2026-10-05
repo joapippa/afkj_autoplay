@@ -19,15 +19,17 @@
         → 設定した編成をすべて使い切ったら、その系統は諦めて次の系統へ
           → どちらも諦めたら実行終了
 
+戦闘は「オート挑戦」ではなく「戦闘」で1戦ずつ行う。勝ったら ← で
+ステージ選択へ戻り、次のステージでもクリア編成の1番目から当て直す。
+オート挑戦だと勝った編成のまま次へ進むが、その勝率は 27/82 = 33% で、
+ステージごとのクリア編成1番目（50/64 = 78%）に大きく劣った。
+
 ステージを1つでも進めていたら、負けた相手は別の（より強い）ステージなので
-1番目のクリア編成から数え直す。進めたかどうかは次の2つを観測できたかで
+1番目のクリア編成から数え直す。進めたかどうかは戦闘勝利の画面を観測できたかで
 判断する（推測ではなく観測に基づくよう、根拠をログに残す）。
 
-    - オート戦闘終了（集計）画面 … 1つ以上クリアしたときだけ出る
-    - 戦闘勝利の画面
-
-クリアしたステージ数は自分では数えず、集計画面に出ている
-「先鋒ステージ進捗 161 ≫ 165」をそのまま読む（digits.py）。
+クリアしたステージは勝利画面ごとに1つ数え、画面に出ている
+「先鋒ステージ進捗 161 ≫ 162」を読んで全体の進み具合を残す（digits.py）。
 
 停止方法:
     Ctrl+C / F10 キー / マウスを画面左上角へ移動
@@ -58,6 +60,15 @@ CONFIDENT_SCORE = 0.93
 # この回数続いたら、その系統はクリアし終えてボタンが消えたと判断する。
 # 1回で決めないのは、演出や一瞬の見落としで系統を捨てないため。
 ENTRY_ABSENT_FRAMES = 3
+
+# 「戦闘」を押してからこの秒数までは、判定できない画面も戦闘中とみなして
+# タップせずに待つ。戦闘画面のテンプレートは撮影済みのオート挑戦の画面から
+# 切り出したもので、1戦ずつの戦闘でも効くかはまだ実走で確かめていないため。
+# 戦闘の制限時間は90秒（画面右上のカウント）なので、読み込みを含めて余裕を見る。
+BATTLE_GRACE_SECONDS = 150.0
+
+# 戦闘中に判定できなかった画面を保存する上限（テンプレートを切り出す材料）。
+BATTLE_UNKNOWN_SAVES = 3
 
 
 def _for_saving(frame: Frame) -> np.ndarray:
@@ -118,17 +129,17 @@ class Stats:
     unknown_frames: int = 0
     # 系統キー → その系統の成績。最初に触れた順で並ぶ。
     modes: dict[str, ModeStats] = field(default_factory=dict)
-    # 集計画面で読んだ「先鋒ステージ進捗」。最初と最後、および読めた回数。
+    # 勝利画面で読んだ「先鋒ステージ進捗」。最初と最後、および読めた回数。
     progress_first: int | None = None
     progress_last: int | None = None
-    summaries_read: int = 0
-    summaries_unread: int = 0
+    progress_read: int = 0
+    progress_unread: int = 0
 
     def note_progress_numbers(self, before: int, after: int) -> None:
         if self.progress_first is None:
             self.progress_first = before
         self.progress_last = after
-        self.summaries_read += 1
+        self.progress_read += 1
 
     def mode(self, key: str) -> ModeStats:
         return self.modes.setdefault(key, ModeStats())
@@ -175,11 +186,11 @@ class Stats:
         return lines or ["系統ごとの記録なし（戦闘に入りませんでした）"]
 
     def progress_report(self) -> str:
-        """集計画面から読んだ進捗。ゲーム自身が出している数字。"""
-        total = self.summaries_read + self.summaries_unread
+        """勝利画面から読んだ進捗。ゲーム自身が出している数字。"""
+        total = self.progress_read + self.progress_unread
         if not total:
-            return "先鋒ステージ進捗: 集計画面が出ませんでした（1ステージもクリアせず）"
-        read = f"集計画面 {total}回中 {self.summaries_read}回 読み取り"
+            return "先鋒ステージ進捗: 勝利画面が出ませんでした（1ステージもクリアせず）"
+        read = f"勝利画面 {total}回中 {self.progress_read}回 読み取り"
         if self.progress_first is None:
             return f"先鋒ステージ進捗: 読み取れませんでした（{read}）"
         return (
@@ -242,6 +253,10 @@ class Runner:
         # これを2回の敗北として数えると挑戦回数を余計に消費してしまう。
         self._battle_observed = True
         self._last_defeat_at = 0.0
+        # 「戦闘」を押した時刻（戦闘が終わったら 0）。戦闘中の判定できない画面を
+        # タップしないために使う。
+        self._battle_started_at = 0.0
+        self._battle_unknown_saved = 0
         # 今開いているポップアップで「>」を押した回数。
         self._arrow_presses = 0
 
@@ -506,6 +521,7 @@ class Runner:
 
         self._giving_up = False
         self.formation_applied = False
+        self._battle_started_at = 0.0
         self._start_new_stage("ステージ選択に戻った")
 
         spec = st.MODES_BY_KEY[mode]
@@ -621,7 +637,7 @@ class Runner:
     def _note_progress(self, evidence: str) -> None:
         """ステージを進めた証拠を記録する。
 
-        呼ぶのは信頼できる観測だけ（オート戦闘終了の集計画面と勝利画面）。
+        呼ぶのは信頼できる観測だけ（勝利画面と、オート戦闘終了の集計画面）。
         看板の変化による勝利数の計上は過大なので、ここには入れない。
         """
         if not self._progressed:
@@ -639,18 +655,19 @@ class Runner:
         """編成画面。
 
         ボタンは左から ← / クリア編成 / オート挑戦 / 戦闘。
-        「戦闘」は手動で戦うためのボタンなので絶対に押さない。押すのは
-        「オート挑戦」のほう。候補にも入れていない。
+        押すのは「戦闘」（1戦だけ戦う）。「オート挑戦」は勝つと編成を
+        引き継いだまま次のステージへ進んでしまうので、候補にも入れていない。
 
-        クリア編成 → 一括適用 → オート挑戦 の順に進むが、一括適用のあとは
+        クリア編成 → 一括適用 → 戦闘 の順に進むが、一括適用のあとは
         再びこの画面に戻ってくる。そのため「すでに編成を適用したか」を
         覚えておき、次に押すボタンを切り替える。
         なお同じ画面で足踏みが続いた場合は、覚えている状態が実態と
         ずれている可能性があるので、もう一方のボタンも試す。
         """
+        self._battle_started_at = 0.0  # 戦闘を始められていない
         if self._giving_up:
             # 諦めたので ← でステージ選択へ戻る。
-            # ここで画面中央下をタップすると「戦闘」（手動戦闘）を
+            # ここで画面中央下をタップすると「戦闘」を
             # 踏みかねないので、← が見つからないときは何もしない。
             log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
             if not self._click_template("戻る_btn", screen_gray, rect):
@@ -665,13 +682,18 @@ class Runner:
             self._state_since = time.time()
 
         if self.formation_applied:
-            order = ["オート挑戦_btn", "クリア編成_btn"]
-            log.info("[%s] オート挑戦を押します", state.label)
+            order = ["戦闘_btn", "クリア編成_btn"]
+            log.info("[%s] 戦闘を押します", state.label)
         else:
-            order = ["クリア編成_btn", "オート挑戦_btn"]
+            # クリア編成が見つからなくても戦闘は押さない（編成を当てずに戦うことになる）。
+            # 本当は適用済みだったなら、足踏みの切り替えで戦闘のほうを試す。
+            order = ["クリア編成_btn"]
             log.info("[%s] クリア編成を押します", state.label)
 
-        self._click_first_available(order, screen_gray, rect)
+        if self._click_first_available(order, screen_gray, rect) == "戦闘_btn":
+            # 戦闘画面を判定できなくても、この戦闘の勝敗は1回として数える
+            self._battle_observed = True
+            self._battle_started_at = time.time()
 
     def _on_clear_formation_list(self, state, match, screen_gray, rect) -> None:
         """クリア編成のポップアップ。
@@ -738,7 +760,7 @@ class Runner:
             self._frozen_since = time.time()
             return
 
-        log.info("[%s] 周回中... (%d秒)", state.label, elapsed)
+        log.info("[%s] 戦っています... (%d秒)", state.label, elapsed)
         time.sleep(self.config.battle_interval)
 
     def _on_loading(self, state, match, screen_gray, rect) -> None:
@@ -746,40 +768,34 @@ class Runner:
         time.sleep(self.config.poll_interval)
 
     def _on_auto_battle_end(self, state, match, screen_gray, rect) -> None:
-        # この画面はどこをタップしても閉じる。閉じると敗北画面へ進む。
-        #
-        # この集計画面は「1つ以上クリアしてから途切れた」ときだけ出る
-        # （一度も勝てずに負けたときは出ない）。つまりこの画面が見えた
-        # ことが、ステージを進めた証拠になる。
+        # オート挑戦の終了集計。オート挑戦は押さないので本来は出ないが、
+        # 出たらタップして閉じる（どこをタップしても閉じる）。
+        # この画面は1つ以上クリアしたときだけ出るので、進めた証拠にはなる。
+        # クリア数は勝利画面で数えているので、ここでは足さない。
         log.info("[%s] タップして閉じます", state.label)
         self._note_progress("オート戦闘終了（集計）画面を観測")
-        if self._state_changed:
-            # クリア数はこの画面に出ている数字をそのまま読む。1画面につき1回。
-            self._read_progress(screen_gray)
         self.formation_applied = False
         self._tap_dismiss(rect)
 
     def _read_progress(self, screen_gray: Frame) -> None:
-        """集計画面の「先鋒ステージ進捗 A ≫ B」を読み、クリア数を計上する。"""
+        """勝利画面の「先鋒ステージ進捗 A ≫ B」を読み、進捗の記録に残す。"""
         if not self.digits.available:
             return
-        got = self.digits.read_progress(screen_gray.gray)
+        got = self.digits.read_progress(screen_gray.gray, digits.VICTORY_PROGRESS_REGION)
         if got is None:
-            self.stats.summaries_unread += 1
-            log.info("  進捗の数字を読み取れませんでした（クリア数は数えません）")
+            self.stats.progress_unread += 1
+            log.info("  進捗の数字を読み取れませんでした")
             return
 
         before, after = got
-        cleared = after - before
-        if cleared < 0 or cleared > 100:
-            # 読めたつもりで見当違いの値なら採らない（演出が数字に重なるなど）
-            self.stats.summaries_unread += 1
+        if after - before != 1:
+            # 1戦で進むのは1ステージだけ。違えば読み違い（演出が数字に重なるなど）
+            self.stats.progress_unread += 1
             log.warning("  進捗の数字が不自然です (%d → %d)。読み飛ばします", before, after)
             return
 
         self.stats.note_progress_numbers(before, after)
-        self.stats.mode(self._mode).victories += cleared
-        log.info("  先鋒ステージ進捗 %d → %d（%dステージクリア）", before, after, cleared)
+        log.info("  先鋒ステージ進捗 %d → %d", before, after)
 
     def _on_defeat(self, state, match, screen_gray, rect) -> None:
         if self._state_changed:
@@ -788,6 +804,7 @@ class Runner:
             self._register_defeat()
 
         self.formation_applied = False
+        self._battle_started_at = 0.0
 
         if self._giving_up:
             log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
@@ -864,28 +881,47 @@ class Runner:
     def _on_victory(self, state, match, screen_gray, rect) -> None:
         """勝利画面。
 
-        オート周回が続いている間は、ゲームが自動で次のステージへ進むので
-        何もしないで待つのが正しい。ここで余計なタップをすると、次の戦闘の
-        画面を触ってしまう。
-        周回が終わっている場合は結果パネルに『挑戦』ボタンが出るので、
-        それを押して次へ進む。
+        結果パネルの下に ← / 統計 / 挑戦 が並ぶ。← でステージ選択へ戻り、
+        次のステージでクリア編成を当て直す。『挑戦』は押さない（次の
+        ステージへ直接進むはずだが、編成画面を通るかを確かめていない）。
+
+        1戦ずつ戦う場合、勝利画面は ← を押すまで残るので見逃さない。
+        そのため勝った回数はここで数える。
         """
-        # 勝った回数はここでは数えない（勝利画面は表示が短く、判定の間隔に
-        # よっては見逃すため。実測でも 88クリアの周回で8回しか見えていない）。
-        # クリア数は集計画面の数字を読む。ここで使うのは
-        # 「先へ進めたか」の判断だけで、見逃しても集計画面で拾える。
+        self._battle_started_at = 0.0
+        if self._state_changed:
+            self._register_victory(screen_gray)
         self._note_progress("戦闘勝利の画面を観測")
 
         if self._auto_run_active(screen_gray):
+            # オート挑戦は押さないので本来は起きない。押されていたら
+            # ゲームが自動で次へ進むので、触らずに待つ。
             log.info("[%s] オート周回が継続中。自動で次へ進むのを待ちます", state.label)
             time.sleep(self.config.poll_interval)
             return
 
-        log.info("[%s] オート周回は終了。次へ進みます", state.label)
         self.formation_applied = False
-        entry = st.MODES_BY_KEY[self._mode].entry_template
-        if not self._click_template(entry, screen_gray, rect):
-            self._tap_dismiss(rect)
+        log.info("[%s] ← でステージ選択へ戻り、次のステージのクリア編成を当て直します", state.label)
+        if self._click_template("戻る_btn", screen_gray, rect):
+            return
+        if self._stuck_for() < 10.0:
+            # パネルのボタンが出そろう前かもしれない
+            log.info("  ← がまだ見えません。少し待ちます")
+            time.sleep(self.config.poll_interval)
+            return
+        # 以前の実行で、勝利画面をタップするとステージ選択へ戻ったのを観測している
+        log.warning("  ← が見つかりません。画面をタップして閉じます")
+        self._tap_dismiss(rect)
+
+    def _register_victory(self, screen_gray: Frame) -> None:
+        """勝った1回を数える。勝利画面が揺れても二重に数えない。"""
+        if not self._battle_observed:
+            log.info("  この勝利は直前と同じものとみて数えません（戦闘を観測していないため）")
+            return
+        self._battle_observed = False
+        self.stats.mode(self._mode).victories += 1
+        self._read_progress(screen_gray)
+        log.info("  → 通算: %s", self.stats.summary())
 
     def _auto_run_active(self, screen_gray: np.ndarray) -> bool:
         """オート周回が続いているか。
@@ -921,19 +957,19 @@ class Runner:
 
     def _click_first_available(
         self, names: list[str], screen_gray: np.ndarray, rect: win.WindowRect
-    ) -> bool:
-        """候補のうち最初に見つかったものをクリックする。
+    ) -> str | None:
+        """候補のうち最初に見つかったものをクリックし、その名前を返す。
 
         ★ 系統（幻霊 / シーズン）のエントリーボタンには使わないこと。
           押し分けが必要なので、候補を並べると別系統に入ってしまう。
         """
         for name in names:
             if self._click_template(name, screen_gray, rect):
-                return True
+                return name
 
         log.warning("  押せるボタンが見つかりません (%s)", ", ".join(names))
         self._escalate(rect)
-        return False
+        return None
 
     def _click_at(self, center: tuple[int, int], rect: win.WindowRect, label: str, score: float) -> None:
         x, y = center
@@ -996,9 +1032,22 @@ class Runner:
 
         報酬・お知らせ・レベルアップなど想定外のポップアップが典型。
         いきなり乱暴に押さず、段階的に閉じにいく。
+
+        ただし「戦闘」を押した直後は、戦闘画面を判定できていないだけの
+        可能性が高い。戦闘中にタップすると英雄のカードを触ってしまうので、
+        BATTLE_GRACE_SECONDS までは何もせずに待つ。
         """
-        self._unknown_streak += 1
         self.stats.unknown_frames += 1
+        in_battle = time.time() - self._battle_started_at
+        if self._battle_started_at and in_battle < BATTLE_GRACE_SECONDS:
+            log.info("画面を判定できません。戦闘中とみて待ちます (%.0f秒)", in_battle)
+            if in_battle > 10.0 and self._battle_unknown_saved < BATTLE_UNKNOWN_SAVES:
+                self._battle_unknown_saved += 1
+                self._save_debug(screen_gray, f"battle_unknown_{self._battle_unknown_saved}")
+            time.sleep(self.config.battle_interval)
+            return
+
+        self._unknown_streak += 1
 
         if self._unknown_streak == 1:
             log.info("画面を判定できません。少し待ちます...")

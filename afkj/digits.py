@@ -44,6 +44,10 @@ log = logging.getLogger(__name__)
 # 数字を探す範囲（画面サイズに対する割合）。緑の帯の「進捗」の右側。
 PROGRESS_REGION = (845 / 1920, 524 / 1200, 1220 / 1920, 574 / 1200)
 
+# 戦闘勝利の画面にも同じ緑の帯が出る（位置だけ下にずれる）。
+# 実測: 勝利画面5枚（11≫12 〜 15≫16）をこの範囲で読み、すべて前後がつながった。
+VICTORY_PROGRESS_REGION = (845 / 1920, 800 / 1200, 1220 / 1920, 850 / 1200)
+
 # 縁取りとみなす暗さ。緑の帯・白い数字・緑の数字のいずれとも十分に離れている。
 OUTLINE_DARKNESS = 95
 
@@ -76,12 +80,17 @@ class DigitReader:
 
     # ── 読み取り ──────────────────────────────────────────────────────────
 
-    def read_progress(self, screen_gray: np.ndarray) -> tuple[int, int] | None:
-        """(進捗の前, 進捗の後) を返す。自信が持てなければ None。"""
+    def read_progress(
+        self, screen_gray: np.ndarray, region: tuple[float, float, float, float] = PROGRESS_REGION
+    ) -> tuple[int, int] | None:
+        """(進捗の前, 進捗の後) を返す。自信が持てなければ None。
+
+        region は集計画面なら PROGRESS_REGION、勝利画面なら VICTORY_PROGRESS_REGION。
+        """
         if not self.available:
             return None
 
-        mask = self._ink_mask(screen_gray)
+        mask = self._ink_mask(screen_gray, region)
         if mask is None:
             return None
         scale = screen_gray.shape[0] / 1200.0
@@ -103,15 +112,15 @@ class DigitReader:
 
         found.sort(key=lambda f: f[1])
         if not self._covers_ink(mask, found):
-            log.debug("集計画面の数字: 覆いきれないので棄権します")
+            log.debug("進捗の数字: 覆いきれないので棄権します")
             return None
         return self._split_two(found)
 
     # ── 内訳 ──────────────────────────────────────────────────────────────
 
-    def _ink_mask(self, screen_gray: np.ndarray) -> np.ndarray | None:
+    def _ink_mask(self, screen_gray: np.ndarray, region) -> np.ndarray | None:
         h, w = screen_gray.shape[:2]
-        x1, y1, x2, y2 = PROGRESS_REGION
+        x1, y1, x2, y2 = region
         crop = screen_gray[int(h * y1):int(h * y2), int(w * x1):int(w * x2)]
         if crop.size == 0:
             return None
