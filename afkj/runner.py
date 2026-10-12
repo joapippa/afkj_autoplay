@@ -68,6 +68,11 @@ ENTRY_ABSENT_FRAMES = 3
 # 数十戦かけるので、取り違えたときの損が大きい）。
 ARROW_ABSENT_FRAMES = 3
 
+# 結社戦線の画面でフロア番号を読む回数の上限。画面が滑り込んでくる途中の
+# フレームでは番号の帯がまだ所定の位置に無く、読めない（実測: 挑戦ボタンが
+# 41px 下にずれていたフレームで失敗し、2秒前の同じ画面では読めていた）。
+FLOOR_READ_TRIES = 3
+
 # 「戦闘」を押してからこの秒数までは、判定できない画面も戦闘中とみなして
 # タップせずに待つ。戦闘画面のテンプレートは撮影済みのオート挑戦の画面から
 # 切り出したもので、1戦ずつの戦闘でも効くかはまだ実走で確かめていないため。
@@ -319,6 +324,9 @@ class Runner:
         self._stage_battles = 0
         # 結社戦線の画面で読んだフロア番号（読めなければ None）。
         self._floor: int | None = None
+        # 結社戦線の画面に入ってから番号を読みにいった回数と、入る前の番号。
+        self._floor_tries = 0
+        self._floor_before: int | None = None
 
         # 同じ画面に留まっているかの検出用
         self._last_state_key: str | None = None
@@ -1084,8 +1092,23 @@ class Runner:
         self.stats.mode(mode)  # 一度も勝ち負けしなくても内訳に出るように
 
         if self._state_changed:
-            before = self._floor
-            self._read_floor(screen_gray)
+            self._floor_before = self._floor
+            self._floor = None
+            self._floor_tries = 0
+        if self._floor is None and self._floor_tries < FLOOR_READ_TRIES:
+            # 読めなければ挑戦を押さずに待ち、画面が落ち着いてから読み直す
+            self._floor_tries += 1
+            if not self._read_floor(screen_gray):
+                if self._floor_tries < FLOOR_READ_TRIES:
+                    log.info(
+                        "  フロア番号を読めません。画面が落ち着くのを待って読み直します (%d/%d)",
+                        self._floor_tries, FLOOR_READ_TRIES,
+                    )
+                    time.sleep(self.config.poll_interval)
+                    return
+                self.stats.floor_unread += 1
+                log.info("  フロア番号を読み取れませんでした（%d回試した）", FLOOR_READ_TRIES)
+            before = self._floor_before
             if before is not None and self._floor is not None and self._floor != before:
                 log.info("  フロア番号が %d → %d に変わっていました", before, self._floor)
                 self._start_new_stage("フロア番号が変わった")
@@ -1100,14 +1123,11 @@ class Runner:
         log.warning("  %s が見つかりません。少し待って押し直します", spec.entry_template)
         time.sleep(self.config.poll_interval)
 
-    def _read_floor(self, screen_gray: Frame) -> None:
-        """結社戦線の画面の「現在：N」を読む。"""
+    def _read_floor(self, screen_gray: Frame) -> bool:
+        """結社戦線の画面の「現在：N」を読む。読めたら True。"""
         value = ocr.read_union_floor(_for_saving(screen_gray))
         if value is None:
-            self.stats.floor_unread += 1
-            self._floor = None
-            log.info("  フロア番号を読み取れませんでした")
-            return
+            return False
 
         last = self.stats.floor_last
         if last is not None and not (last <= value <= last + 1):
@@ -1119,6 +1139,7 @@ class Runner:
         self.stats.floor_last = value
         self._floor = value
         log.info("  フロア番号: %d", value)
+        return True
 
     def _on_guild_modes(self, state, match, screen_gray, rect) -> None:
         log.info("[%s] 結社戦線を開きます", state.label)
