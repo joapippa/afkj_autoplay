@@ -332,9 +332,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[エラー] 画像ファイルが見つかりません: {', '.join(missing)}")
         return 1
 
-    if not win.is_admin() and not args.dry_run:
-        print("[警告] 管理者権限がありません。クリックがゲームに届かない可能性があります。")
-        print("       ターミナルを右クリック →「管理者として実行」で開き直すことを推奨します。")
+    # print ではなく log で残す。クリックが効かなかったとき、あとから
+    # afkj.log だけで権限を確かめられるようにするため（SendInput は管理者
+    # 権限が無くても失敗を返さず、クリックが黙って捨てられる）。
+    if win.is_admin():
+        log.info("管理者権限: あり")
+    elif not args.dry_run:
+        log.warning("管理者権限がありません。クリックがゲームに届かない可能性があります。")
+        log.warning("ターミナルを右クリック →「管理者として実行」で開き直すことを推奨します。")
+    else:
+        log.info("管理者権限: なし（判定のみなので影響なし）")
 
     game = win.GameWindow(WINDOW_TITLE)
     if not game.attach():
