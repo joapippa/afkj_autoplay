@@ -829,6 +829,14 @@ class Runner:
             state.label, self._formation_index + 1,
             self._attempts + 1, self._allowed_attempts(),
         )
+        if self.config.record and self._formation_index:
+            # 「>」で送ったあとの画面は状態が変わらないので _record_transition では
+            # 残らない。本当に別の編成を当てたかを後で確かめられるよう、ここで残す。
+            path = self.config.debug_dir / (
+                f"rec_{time.strftime('%H%M%S')}_apply_{self._formation_index + 1}.png"
+            )
+            if imwrite_unicode(path, _for_saving(screen_gray)):
+                log.info("  記録: %s", path.name)
         if self._click_template("一括適用_btn", screen_gray, rect):
             self.formation_applied = True
         else:
