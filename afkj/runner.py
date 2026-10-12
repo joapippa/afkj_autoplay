@@ -62,6 +62,12 @@ CONFIDENT_SCORE = 0.93
 # 1回で決めないのは、演出や一瞬の見落としで系統を捨てないため。
 ENTRY_ABSENT_FRAMES = 3
 
+# クリア編成のポップアップで「>」が見つからないことがこの回数続いたら、
+# クリア編成が尽きたと判断する。1回で決めると、送った直後の演出などで
+# 一瞬見落としただけで実行全体が終わってしまう（結社戦線は1フロアに
+# 数十戦かけるので、取り違えたときの損が大きい）。
+ARROW_ABSENT_FRAMES = 3
+
 # 「戦闘」を押してからこの秒数までは、判定できない画面も戦闘中とみなして
 # タップせずに待つ。戦闘画面のテンプレートは撮影済みのオート挑戦の画面から
 # 切り出したもので、1戦ずつの戦闘でも効くかはまだ実走で確かめていないため。
@@ -93,6 +99,9 @@ class RunConfig:
     # 2番目で2回、3〜5番目で1回ずつ試し、そこで諦める。
     # 深く粘るより広く浅く（README「値の決め方」参照）。
     formation_attempts: tuple[int, ...] = (3, 2, 1, 1, 1)
+    # True なら最後の値を、クリア編成が尽きるまで繰り返す。(20, 10) なら
+    # 1番目で20回、2番目以降は「>」が無くなるまで10回ずつ（結社戦線の既定）。
+    repeat_last_attempts: bool = False
     poll_interval: float = 1.2  # 通常時の判定間隔（秒）
     battle_interval: float = 3.0  # 戦闘中の判定間隔（秒）
     after_click: float = 1.6  # クリック後に画面が変わるのを待つ時間（秒）
@@ -304,6 +313,8 @@ class Runner:
         self._battle_unknown_saved = 0
         # 今開いているポップアップで「>」を押した回数。
         self._arrow_presses = 0
+        # 「>」が続けて見つからなかった回数。
+        self._arrow_missing = 0
         # このステージ（フロア）で戦った回数。勝ったときに「何戦目か」を残す。
         self._stage_battles = 0
         # 結社戦線の画面で読んだフロア番号（読めなければ None）。
@@ -399,10 +410,11 @@ class Runner:
         ]
 
     def _attempts_plan_text(self) -> str:
-        return " → ".join(
-            f"{i + 1}番目のクリア編成で{n}回"
-            for i, n in enumerate(self.config.formation_attempts)
-        ) + " → 諦めて次の系統へ"
+        plan = self.config.formation_attempts
+        text = " → ".join(f"{i + 1}番目のクリア編成で{n}回" for i, n in enumerate(plan))
+        if self.config.repeat_last_attempts:
+            text += f" → 以降の編成も各{plan[-1]}回（クリア編成が尽きるまで）"
+        return text + " → 諦めて次の系統へ"
 
     def _check_stop_conditions(self) -> str | None:
         if win.is_key_down(win.VK_F10):
@@ -714,6 +726,8 @@ class Runner:
         plan = self.config.formation_attempts
         if self._formation_index < len(plan):
             return max(1, plan[self._formation_index])
+        if self.config.repeat_last_attempts and plan:
+            return max(1, plan[-1])
         return 0
 
     def _on_formation(self, state, match, screen_gray, rect) -> None:
@@ -774,6 +788,7 @@ class Runner:
         """
         if self._state_changed:
             self._arrow_presses = 0
+            self._arrow_missing = 0
 
         if self._giving_up:
             log.info("[%s] 諦めたのでポップアップを閉じます", state.label)
@@ -793,10 +808,20 @@ class Runner:
             )
             if self._click_template("次の編成_btn", screen_gray, rect):
                 self._arrow_presses += 1
-            else:
-                # 「>」が無い＝これ以上クリア編成が無い。ここが本当の限界。
-                log.info("  > が見つかりません。これ以上のクリア編成はありません")
-                self._give_up_mode(f"クリア編成が{self._formation_index}個で尽きた")
+                self._arrow_missing = 0
+                return
+            # 「>」が無い＝これ以上クリア編成が無い。ここが本当の限界。
+            # ただし一瞬の見落としで諦めないよう、続けて確認できてから決める。
+            self._arrow_missing += 1
+            if self._arrow_missing < ARROW_ABSENT_FRAMES:
+                log.info(
+                    "  > が見つかりません（確認 %d/%d）",
+                    self._arrow_missing, ARROW_ABSENT_FRAMES,
+                )
+                time.sleep(self.config.poll_interval)
+                return
+            log.info("  > が見つかりません。これ以上のクリア編成はありません")
+            self._give_up_mode(f"クリア編成が{self._formation_index}個で尽きた")
             return
 
         log.info(
@@ -937,7 +962,9 @@ class Runner:
         self._attempts = 0
         self._arrow_presses = 0
         plan = self.config.formation_attempts
-        if self._formation_index >= len(plan):
+        if self._formation_index >= len(plan) and not self.config.repeat_last_attempts:
+            # 繰り返す指定なら、ここでは諦めない。クリア編成の「>」が無くなった
+            # ところ（_on_clear_formation_list）が限界になる。
             self._give_up_mode(
                 "クリア編成 " + "＋".join(f"{n}回" for n in plan) + " を試し切った"
             )

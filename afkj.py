@@ -265,17 +265,29 @@ def _parse_modes(text: str) -> tuple[str, ...] | None:
     return tuple(keys) or None
 
 
-def _parse_attempts(text: str) -> tuple[int, ...] | None:
-    """`3,2` のような指定を、各クリア編成での挑戦回数にする。"""
+# --attempts を省いたときの値（キーは states.SENPO / states.UNION）。結社戦線は20戦に1勝できれば良いほうなので
+# 先鋒よりずっと深く粘る（2026-10-12 ユーザーの判断）。
+DEFAULT_ATTEMPTS = {"senpo": "3,2,1,1,1", "union": "20,10+"}
+
+
+def _parse_attempts(text: str) -> tuple[tuple[int, ...], bool] | None:
+    """`3,2` のような指定を、各クリア編成での挑戦回数にする。
+
+    最後の値に `+` を付けると（`20,10+`）、その回数をクリア編成が尽きるまで
+    繰り返す。戻り値は (回数の並び, 最後を繰り返すか)。
+    """
+    items = [raw.strip() for raw in text.split(",") if raw.strip()]
+    repeat = bool(items) and items[-1].endswith("+")
+    if repeat:
+        items[-1] = items[-1][:-1].strip()
     values: list[int] = []
-    for raw in text.split(","):
-        item = raw.strip()
-        if not item:
-            continue
+    for item in items:
         if not item.isdigit() or int(item) < 1:
             return None
         values.append(int(item))
-    return tuple(values) or None
+    if not values:
+        return None
+    return tuple(values), repeat
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -298,11 +310,15 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("        別々に実行してください（例: --modes 結社戦線）")
         return 1
 
-    attempts = _parse_attempts(args.attempts)
-    if attempts is None:
-        print(f"[エラー] --attempts の指定が不正です: {args.attempts}")
-        print("        1以上の整数をカンマで並べてください（例: 3,2）")
+    content = contents.pop()
+    attempts_text = args.attempts or DEFAULT_ATTEMPTS[content]
+    parsed = _parse_attempts(attempts_text)
+    if parsed is None:
+        print(f"[エラー] --attempts の指定が不正です: {attempts_text}")
+        print("        1以上の整数をカンマで並べてください（例: 3,2）。")
+        print("        最後に + を付けると、その回数をクリア編成が尽きるまで繰り返します（例: 20,10+）")
         return 1
+    attempts, repeat_last = parsed
 
     store = TemplateStore(TEMPLATES_DIR)
     store.load()
@@ -328,6 +344,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = RunConfig(
         mode_order=mode_order,
         formation_attempts=attempts,
+        repeat_last_attempts=repeat_last,
         max_battles=args.max_battles,
         max_runtime=args.max_minutes * 60 if args.max_minutes else 0.0,
         dry_run=args.dry_run,
@@ -401,11 +418,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument(
         "--attempts",
-        default="3,2,1,1,1",
+        default=None,
         metavar="X,Y",
         help=(
             "各クリア編成での挑戦回数。3,2,1,1,1 なら1番目の編成で3回、"
-            "2番目で2回、3〜5番目で1回ずつ試して諦める (既定: 3,2,1,1,1)"
+            "2番目で2回、3〜5番目で1回ずつ試して諦める。最後に + を付けると"
+            "その回数をクリア編成が尽きるまで繰り返す "
+            "(既定: 先鋒ステージ 3,2,1,1,1 / 結社戦線 20,10+)"
         ),
     )
     p_run.add_argument(
