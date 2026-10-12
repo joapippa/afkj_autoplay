@@ -327,6 +327,8 @@ class Runner:
         # 結社戦線の画面に入ってから番号を読みにいった回数と、入る前の番号。
         self._floor_tries = 0
         self._floor_before: int | None = None
+        # 最後に読めたフロア番号のあとに勝った回数。次に読む番号の妥当な範囲を決める。
+        self._wins_since_floor = 0
 
         # 同じ画面に留まっているかの検出用
         self._last_state_key: str | None = None
@@ -1053,6 +1055,7 @@ class Runner:
             )
             # 次のフロアの番号は結社戦線の画面で読み直す。推測で埋めない。
             self._floor = None
+            self._wins_since_floor += 1
         else:
             self._read_progress(screen_gray)
         log.info("  → 通算: %s", self.stats.summary())
@@ -1108,6 +1111,7 @@ class Runner:
                     return
                 self.stats.floor_unread += 1
                 log.info("  フロア番号を読み取れませんでした（%d回試した）", FLOOR_READ_TRIES)
+                self._save_floor_screen(screen_gray, "floor_unread")
             before = self._floor_before
             if before is not None and self._floor is not None and self._floor != before:
                 log.info("  フロア番号が %d → %d に変わっていました", before, self._floor)
@@ -1130,16 +1134,32 @@ class Runner:
             return False
 
         last = self.stats.floor_last
-        if last is not None and not (last <= value <= last + 1):
-            # 1戦で進むのは1フロアだけで、戻ることもない。読み違いかもしれないが、
-            # どちらが正しいか決められないので、警告だけ出してそのまま使う。
-            log.warning("  フロア番号が不自然です（前回 %d → 今回 %d）", last, value)
+        if last is not None:
+            # 1勝で進むのは1フロアだけで、戻ることもない。範囲を外れた番号は読み違いと
+            # みて採らない（実測: 26 をクリアした直後の 27 を「2」と読んだ）。
+            # 勝利画面を見逃した場合に備えて、1つ先までは受け入れる。
+            high = last + self._wins_since_floor + 1
+            if not (last <= value <= high):
+                log.warning(
+                    "  フロア番号を %d と読みましたが、前回 %d のあと %d勝なので "
+                    "%d〜%d のはずです。読み違いとみて採りません",
+                    value, last, self._wins_since_floor, last, high,
+                )
+                self._save_floor_screen(screen_gray, f"floor_misread_{value}")
+                return False
+        self._wins_since_floor = 0
         if self.stats.floor_first is None:
             self.stats.floor_first = value
         self.stats.floor_last = value
         self._floor = value
         log.info("  フロア番号: %d", value)
         return True
+
+    def _save_floor_screen(self, screen_gray: Frame, label: str) -> None:
+        """フロア番号を読めなかった画面を残す（OCR の読み違いを調べる材料）。"""
+        path = self.config.debug_dir / f"{time.strftime('%H%M%S')}_{label}.png"
+        if imwrite_unicode(path, _for_saving(screen_gray)):
+            log.info("  その画面を保存: %s", path.name)
 
     def _on_guild_modes(self, state, match, screen_gray, rect) -> None:
         log.info("[%s] 結社戦線を開きます", state.label)
