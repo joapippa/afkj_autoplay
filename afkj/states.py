@@ -26,8 +26,28 @@
 ステージのクリア履歴1番目（50/64 = 78%）に大きく劣った（2026-10-05 の実行）。
 1戦ずつ戦えば、ステージごとにクリア履歴の編成を当て直せる。
 
-★ 戦闘勝利から ← で戻る流れは、まだ実走で確かめていない。以前の実行で
-  勝利画面をタップしたときにステージ選択へ戻ったこと（3回）は観測済み。
+戦闘勝利から ← で戻る流れは 2026-10-05 の実走（115勝）で確かめた。
+
+結社戦線（Union Campaign）の流れ
+--------------------------------
+編成画面から先は先鋒ステージと同じ画面・同じボタンなので、同じ状態を使う
+（テンプレートも先鋒のものがそのまま 0.87〜0.99 で当たった）。違うのは入口まで。
+
+    ワールド画面 ─[モード]→ モード画面 ─[ギルド]→ ギルドのモード画面
+    ギルドのモード画面 ─[結社戦線]→ 結社戦線の画面 ─[挑戦]→ 編成画面
+    （地図画面が開いていたら ← でワールド画面へ戻る）
+    戦闘勝利 ─[← 戻る]→ 結社戦線の画面 → 次のフロアのクリア編成を当て直す
+
+ステージは「フロア」と呼ばれ、結社戦線の画面に「現在：22」と出ている。
+1フロアは3つの WAVE からなる（画面上部の ◇>>◇>>◇）。
+
+★ 結社戦線の勝利画面はまだ撮れていない（撮影時は2戦とも敗北）。
+  先鋒と同じ「戦闘勝利」「←」が出る前提で組んでいる。
+
+どちらを回すかで有効な状態を切り替える（StateSpec.content）。
+結社戦線の「挑戦」と先鋒ステージ選択の「挑戦」は白黒では見分けられず
+（先鋒の 挑戦_btn が結社戦線の画面に 0.86 で当たる）、両方を同時に有効に
+すると別のコンテンツに入ってしまうため。
 
 編成ポップアップには右端に「>」ボタンがあり、押すごとに2番目・3番目…の
 クリア編成が表示される。表示中の編成が一括適用の対象になる。
@@ -42,6 +62,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+# 回すコンテンツ。1回の実行ではどちらか一方だけを回す。
+SENPO = "senpo"  # 先鋒ステージ（AFKステージ）
+UNION = "union"  # 結社戦線（Union Campaign）
+
+CONTENT_LABELS = {SENPO: "先鋒ステージ", UNION: "結社戦線"}
 
 
 @dataclass(frozen=True)
@@ -70,22 +96,26 @@ class StateSpec:
     priority: int = 0
     # 操作せず画面が変わるのを待つ状態
     passive: bool = False
+    # この状態を使うコンテンツ。None なら共通（編成画面から先）。
+    content: str | None = None
     note: str = ""
 
 
 @dataclass(frozen=True)
 class ModeSpec:
-    """先鋒ステージの系統（幻霊 / シーズン）。"""
+    """回す系統（幻霊 / シーズン / 結社戦線）。"""
 
     key: str
     cli_name: str  # コマンドラインでの指定名
-    label: str  # 戦闘画面の看板に出る名前
-    entry_template: str  # ステージ選択画面で押すボタン
+    label: str  # ログに出す名前
+    entry_template: str  # 入口の画面で押すボタン
+    content: str = SENPO
     note: str = ""
 
 
 PHANTOM = "phantom"
 SEASON = "season"
+UNION_MODE = "union"
 
 # 先鋒ステージは「幻霊先鋒ステージ M」と「シーズン先鋒ステージ N」の2つから成り、
 # それぞれ独立に進む。ステージ選択画面のボタンで分岐する。
@@ -113,6 +143,15 @@ MODES: tuple[ModeSpec, ...] = (
         entry_template="挑戦_btn",
         note="ステージ選択画面 右の緑ボタン『挑戦』から入る",
     ),
+    # 結社戦線は系統が1つだけ。先鋒ステージとは別の実行で回す。
+    ModeSpec(
+        key=UNION_MODE,
+        cli_name="結社戦線",
+        label="結社戦線",
+        entry_template="結社挑戦_btn",
+        content=UNION,
+        note="結社戦線の画面 右下のオレンジのボタン『挑戦』から入る",
+    ),
 )
 
 MODES_BY_KEY = {m.key: m for m in MODES}
@@ -123,6 +162,11 @@ DEFAULT_MODE_ORDER: tuple[str, ...] = (PHANTOM, SEASON)
 
 
 STAGE_SELECT = "stage_select"
+WORLD = "world"
+WORLD_MAP = "world_map"
+MODE_MENU = "mode_menu"
+GUILD_MODES = "guild_modes"
+UNION_TOP = "union_top"
 FORMATION = "formation"
 CLEAR_FORMATION_LIST = "clear_formation_list"
 IN_BATTLE = "in_battle"
@@ -176,7 +220,51 @@ STATES: tuple[StateSpec, ...] = (
         label="ステージ選択",
         detect=("幻霊挑戦_btn", "挑戦_btn"),
         priority=5,
+        content=SENPO,
         note="幻霊挑戦 / 挑戦 ボタンが見える画面",
+    ),
+    # ── 結社戦線の入口までの道のり ──────────────────────────────────
+    StateSpec(
+        key=UNION_TOP,
+        label="結社戦線",
+        detect=("結社戦線見出し",),
+        priority=5,
+        content=UNION,
+        note="左上に『結社戦線』の見出し、右下に挑戦ボタンがある画面",
+    ),
+    StateSpec(
+        key=GUILD_MODES,
+        label="ギルドのモード",
+        detect=("結社戦線_card",),
+        priority=4,
+        content=UNION,
+        note="ギルド対決 / 結社戦線 / 狩猟懸賞 / 砂盤演兵 のカードが並ぶ画面",
+    ),
+    StateSpec(
+        key=MODE_MENU,
+        label="モード",
+        detect=("モード見出し",),
+        priority=4,
+        content=UNION,
+        note="左上に『モード』の見出し。下部に 通常 / ギルド / イベント のカテゴリ",
+    ),
+    StateSpec(
+        key=WORLD_MAP,
+        label="地図",
+        detect=("地図切り替え_btn",),
+        priority=3,
+        content=UNION,
+        note="ワールドの地図。← でワールド画面へ戻る",
+    ),
+    StateSpec(
+        key=WORLD,
+        label="ワールド",
+        # モード画面の下部にも同じバーがあり 0.89 で当たるので、
+        # モード画面（優先度4）より低くする。マップが違っても 0.97 で当たる。
+        detect=("モード_btn",),
+        priority=2,
+        content=UNION,
+        note="フィールド画面。下部に 神秘屋 / モード / 英雄ホール / ギルド のバー",
     ),
     # ── 待つだけの画面 ──────────────────────────────────────────────
     StateSpec(
@@ -226,10 +314,21 @@ def required_templates() -> set[str]:
     return {name for state in STATES for name in state.detect}
 
 
+def states_for(content: str) -> list[StateSpec]:
+    """そのコンテンツを回すときに使う状態（共通のものを含む）。"""
+    return [s for s in STATES if s.content in (None, content)]
+
+
 # 判定には使わないが、操作のために必要なテンプレート。
 # 欠けていても周回そのものは回るが、その機能だけが使えなくなる。
 # runner.py の起動時に照合し、欠けていれば何ができなくなるかを警告する。
 OPTIONAL_ACTION_TEMPLATES: dict[str, str] = {
     "次の編成_btn": "別のクリア編成に切り替えられません（1番目だけで再挑戦します）",
     "戻る_btn": "諦めたときにステージ選択へ戻れません（画面タップで代替します）",
+}
+
+# 結社戦線の入口までの道のりで押すボタン。
+UNION_ACTION_TEMPLATES: dict[str, str] = {
+    "ギルド_tab": "モード画面からギルドのカテゴリへ移れません",
+    "結社挑戦_btn": "結社戦線の画面から挑戦に入れません",
 }

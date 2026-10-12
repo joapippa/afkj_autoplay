@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 
 from . import digits
+from . import ocr
 from . import states as st
 from . import window as win
 from .vision import Frame, TemplateStore, imwrite_unicode, to_gray
@@ -117,6 +118,17 @@ class ModeStats:
     give_up_reason: str = ""
     # ステージ選択にこの系統のボタンが無かった（クリアし終えて消えた）。
     absent: bool = False
+    # クリア編成ごとの勝ち負け。キーは 0 始まりの番号（1番目の編成なら 0）。
+    formation_wins: dict[int, int] = field(default_factory=dict)
+    formation_defeats: dict[int, int] = field(default_factory=dict)
+
+    def formation_report(self) -> str:
+        """「1番目 勝ち 2 負け 5」のように編成ごとに並べる。"""
+        used = sorted(set(self.formation_wins) | set(self.formation_defeats))
+        return " / ".join(
+            f"{i + 1}番目 勝ち {self.formation_wins.get(i, 0)} 負け {self.formation_defeats.get(i, 0)}"
+            for i in used
+        )
 
 
 @dataclass
@@ -134,6 +146,14 @@ class Stats:
     progress_last: int | None = None
     progress_read: int = 0
     progress_unread: int = 0
+    # 回しているコンテンツ（先鋒ステージ / 結社戦線）。進捗の出し方が違う。
+    content: str = st.SENPO
+    # 結社戦線のフロア番号（結社戦線の画面の「現在：N」を読んだもの）。
+    floor_first: int | None = None
+    floor_last: int | None = None
+    floor_unread: int = 0
+    # クリアしたフロア: (フロア番号 or None, 勝った編成の番号 1〜, そのフロアで何戦目か)
+    floors_cleared: list[tuple[int | None, int, int]] = field(default_factory=list)
 
     def note_progress_numbers(self, before: int, after: int) -> None:
         if self.progress_first is None:
@@ -183,10 +203,14 @@ class Stats:
             lines.append(
                 f"{label}: 勝ち {s.victories} 負け {s.defeats} / {state}"
             )
+            if s.formation_wins or s.formation_defeats:
+                lines.append(f"  クリア編成ごと: {s.formation_report()}")
         return lines or ["系統ごとの記録なし（戦闘に入りませんでした）"]
 
     def progress_report(self) -> str:
         """勝利画面から読んだ進捗。ゲーム自身が出している数字。"""
+        if self.content == st.UNION:
+            return self.floor_report()
         total = self.progress_read + self.progress_unread
         if not total:
             return "先鋒ステージ進捗: 勝利画面が出ませんでした（1ステージもクリアせず）"
@@ -197,6 +221,22 @@ class Stats:
             f"先鋒ステージ進捗: {self.progress_first} → {self.progress_last} "
             f"(+{self.progress_last - self.progress_first}) / {read}"
         )
+
+    def floor_report(self) -> str:
+        """結社戦線のフロアの進み具合と、クリアしたフロアの内訳。"""
+        if self.floor_first is None:
+            head = "結社戦線のフロア: 読み取れませんでした"
+        else:
+            head = f"結社戦線のフロア: {self.floor_first} → {self.floor_last}"
+        if self.floor_unread:
+            head += f"（読み取れなかった回数 {self.floor_unread}）"
+        if not self.floors_cleared:
+            return head + " / クリアしたフロアなし"
+        detail = ", ".join(
+            f"{'?' if floor is None else floor}（{index}番目の編成・{battles}戦目）"
+            for floor, index, battles in self.floors_cleared
+        )
+        return f"{head} / クリア {len(self.floors_cleared)}: {detail}"
 
 
 class StopReason:
@@ -219,6 +259,11 @@ class Runner:
         self.store = store
         self.config = config
         self.stats = Stats()
+
+        # 回すコンテンツ。系統の並びはすべて同じコンテンツのもの（afkj.py で確かめている）。
+        first = config.mode_order[0] if config.mode_order else st.PHANTOM
+        self.content = st.MODES_BY_KEY[first].content
+        self.stats.content = self.content
 
         # 有効な状態（テンプレートが揃っているものだけ）
         self.states = self._enabled_states()
@@ -259,6 +304,10 @@ class Runner:
         self._battle_unknown_saved = 0
         # 今開いているポップアップで「>」を押した回数。
         self._arrow_presses = 0
+        # このステージ（フロア）で戦った回数。勝ったときに「何戦目か」を残す。
+        self._stage_battles = 0
+        # 結社戦線の画面で読んだフロア番号（読めなければ None）。
+        self._floor: int | None = None
 
         # 同じ画面に留まっているかの検出用
         self._last_state_key: str | None = None
@@ -280,13 +329,16 @@ class Runner:
         状態判定用のテンプレート（states.py の detect）は _enabled_states が
         面倒を見るが、押すボタンのほうは判定に出てこないので気づけない。
         """
-        for name, effect in st.OPTIONAL_ACTION_TEMPLATES.items():
+        actions = dict(st.OPTIONAL_ACTION_TEMPLATES)
+        if self.content == st.UNION:
+            actions.update(st.UNION_ACTION_TEMPLATES)
+        for name, effect in actions.items():
             if name not in self.store.templates:
                 log.warning("テンプレート『%s』が未登録です → %s", name, effect)
 
     def _enabled_states(self) -> list[st.StateSpec]:
         enabled: list[st.StateSpec] = []
-        for state in st.STATES:
+        for state in st.states_for(self.content):
             available = [n for n in state.detect if n in self.store.templates]
             if not available:
                 log.warning(
@@ -306,6 +358,7 @@ class Runner:
         """停止するまで回し続ける。停止理由を返す。"""
         log.info("=" * 60)
         log.info("自動操作 開始%s", " / 判定のみ・クリックしません" if self.config.dry_run else "")
+        log.info("コンテンツ: %s", st.CONTENT_LABELS[self.content])
         log.info("回す順番: %s", " → ".join(self._mode_labels()))
         log.info("各ステージの粘り方: %s", self._attempts_plan_text())
         log.info("停止: Ctrl+C / F10 / マウスを画面左上角へ")
@@ -335,6 +388,10 @@ class Runner:
 
             self._unknown_streak = 0
             self._act(state, match, screen_gray, rect)
+
+    def _entry_screen_label(self) -> str:
+        """← で戻る先の画面（ログ用）。"""
+        return "結社戦線の画面" if self.content == st.UNION else "ステージ選択"
 
     def _mode_labels(self) -> list[str]:
         return [
@@ -486,6 +543,11 @@ class Runner:
             st.AUTO_BATTLE_END: self._on_auto_battle_end,
             st.DEFEAT: self._on_defeat,
             st.VICTORY: self._on_victory,
+            st.UNION_TOP: self._on_union_top,
+            st.GUILD_MODES: self._on_guild_modes,
+            st.MODE_MENU: self._on_mode_menu,
+            st.WORLD_MAP: self._on_world_map,
+            st.WORLD: self._on_world,
         }.get(state.key)
 
         if handler is None:
@@ -569,6 +631,8 @@ class Runner:
         """ステージ選択画面に見えている、今の系統以外のエントリーボタン。"""
         found = []
         for spec in st.MODES:
+            if spec.content != self.content:
+                continue  # 結社戦線の「挑戦」は先鋒の「挑戦」と見分けられない
             if spec.key == mode or spec.entry_template not in self.store.templates:
                 continue
             match = self.store.find(spec.entry_template, screen_gray)
@@ -618,7 +682,7 @@ class Runner:
         self._giving_up_since = time.time()
         remaining = self._pick_mode()
         if remaining is None:
-            log.info("★ すべての系統を回し切りました。ステージ選択へ戻って終了します")
+            log.info("★ すべての系統を回し切りました。ここで終了します")
         else:
             log.info("★ 次は %s を回します", st.MODES_BY_KEY[remaining].label)
 
@@ -633,6 +697,7 @@ class Runner:
         self._progressed = False
         self._progress_evidence = ""
         self._arrow_presses = 0
+        self._stage_battles = 0
 
     def _note_progress(self, evidence: str) -> None:
         """ステージを進めた証拠を記録する。
@@ -669,7 +734,7 @@ class Runner:
             # 諦めたので ← でステージ選択へ戻る。
             # ここで画面中央下をタップすると「戦闘」を
             # 踏みかねないので、← が見つからないときは何もしない。
-            log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
+            log.info("[%s] 諦めたので ← で%sへ戻ります", state.label, self._entry_screen_label())
             if not self._click_template("戻る_btn", screen_gray, rect):
                 log.warning("  ← が見つかりません。少し待って押し直します")
                 time.sleep(self.config.poll_interval)
@@ -807,7 +872,7 @@ class Runner:
         self._battle_started_at = 0.0
 
         if self._giving_up:
-            log.info("[%s] 諦めたので ← でステージ選択へ戻ります", state.label)
+            log.info("[%s] 諦めたので ← で%sへ戻ります", state.label, self._entry_screen_label())
             if not self._click_template("戻る_btn", screen_gray, rect):
                 log.warning("  ← が見つかりません。少し待って押し直します")
                 time.sleep(self.config.poll_interval)
@@ -843,7 +908,11 @@ class Runner:
         self._battle_observed = False
         self._last_defeat_at = time.time()
 
-        self.stats.mode(self._mode).defeats += 1
+        mode_stats = self.stats.mode(self._mode)
+        mode_stats.defeats += 1
+        index = self._formation_index
+        mode_stats.formation_defeats[index] = mode_stats.formation_defeats.get(index, 0) + 1
+        self._stage_battles += 1
         log.info("  → 通算: %s", self.stats.summary())
 
         if self._progressed:
@@ -891,7 +960,6 @@ class Runner:
         self._battle_started_at = 0.0
         if self._state_changed:
             self._register_victory(screen_gray)
-        self._note_progress("戦闘勝利の画面を観測")
 
         if self._auto_run_active(screen_gray):
             # オート挑戦は押さないので本来は起きない。押されていたら
@@ -901,7 +969,10 @@ class Runner:
             return
 
         self.formation_applied = False
-        log.info("[%s] ← でステージ選択へ戻り、次のステージのクリア編成を当て直します", state.label)
+        log.info(
+            "[%s] ← で%sへ戻り、次のステージのクリア編成を当て直します",
+            state.label, self._entry_screen_label(),
+        )
         if self._click_template("戻る_btn", screen_gray, rect):
             return
         if self._stuck_for() < 10.0:
@@ -914,14 +985,35 @@ class Runner:
         self._tap_dismiss(rect)
 
     def _register_victory(self, screen_gray: Frame) -> None:
-        """勝った1回を数える。勝利画面が揺れても二重に数えない。"""
+        """勝った1回を数える。勝利画面が揺れても二重に数えない。
+
+        勝てば次は別のステージなので、ここで粘り方を最初から数え直す。
+        先鋒では ← で戻ったステージ選択でも数え直すが、結社戦線の画面では
+        数え直さない（_on_union_top）ので、勝った時点で済ませておく。
+        """
         if not self._battle_observed:
             log.info("  この勝利は直前と同じものとみて数えません（戦闘を観測していないため）")
             return
         self._battle_observed = False
-        self.stats.mode(self._mode).victories += 1
-        self._read_progress(screen_gray)
+        mode_stats = self.stats.mode(self._mode)
+        mode_stats.victories += 1
+        index = self._formation_index
+        mode_stats.formation_wins[index] = mode_stats.formation_wins.get(index, 0) + 1
+        self._stage_battles += 1
+
+        if self.content == st.UNION:
+            floor = self._floor
+            self.stats.floors_cleared.append((floor, index + 1, self._stage_battles))
+            log.info(
+                "  ★ フロア%s クリア（%d番目のクリア編成・このフロア%d戦目）",
+                "?" if floor is None else floor, index + 1, self._stage_battles,
+            )
+            # 次のフロアの番号は結社戦線の画面で読み直す。推測で埋めない。
+            self._floor = None
+        else:
+            self._read_progress(screen_gray)
         log.info("  → 通算: %s", self.stats.summary())
+        self._start_new_stage("勝った")
 
     def _auto_run_active(self, screen_gray: np.ndarray) -> bool:
         """オート周回が続いているか。
@@ -933,6 +1025,87 @@ class Runner:
         if "オート挑戦中" not in self.store.templates:
             return False
         return self.store.find("オート挑戦中", screen_gray) is not None
+
+    # ── 結社戦線 ──────────────────────────────────────────────────────────
+
+    def _on_union_top(self, state, match, screen_gray, rect) -> None:
+        """結社戦線の画面。フロア番号を読んでから『挑戦』を押す。
+
+        先鋒のステージ選択と違い、ここに戻っただけでは粘り方を数え直さない。
+        勝ったときに数え直し済みなので、勝たずにここへ戻った（想定外）なら
+        同じフロアの続きのはずで、数え直すと同じ編成で永久に粘りかねない。
+        ただしフロア番号が変わっていたら、勝利画面を見逃したとみて数え直す。
+
+        『挑戦』が見つからなくても画面をタップしない。_tap_dismiss の位置の
+        すぐ下に『掃討』ボタンがあるため。
+        """
+        mode = self._pick_mode()
+        if mode is None:
+            return  # ループ先頭の停止判定で止まる
+        self._mode = mode
+        self._giving_up = False
+        self.formation_applied = False
+        self._battle_started_at = 0.0
+        self.stats.mode(mode)  # 一度も勝ち負けしなくても内訳に出るように
+
+        if self._state_changed:
+            before = self._floor
+            self._read_floor(screen_gray)
+            if before is not None and self._floor is not None and self._floor != before:
+                log.info("  フロア番号が %d → %d に変わっていました", before, self._floor)
+                self._start_new_stage("フロア番号が変わった")
+
+        spec = st.MODES_BY_KEY[mode]
+        log.info(
+            "[%s] フロア%s に挑戦します",
+            state.label, "?" if self._floor is None else self._floor,
+        )
+        if self._click_template(spec.entry_template, screen_gray, rect):
+            return
+        log.warning("  %s が見つかりません。少し待って押し直します", spec.entry_template)
+        time.sleep(self.config.poll_interval)
+
+    def _read_floor(self, screen_gray: Frame) -> None:
+        """結社戦線の画面の「現在：N」を読む。"""
+        value = ocr.read_union_floor(_for_saving(screen_gray))
+        if value is None:
+            self.stats.floor_unread += 1
+            self._floor = None
+            log.info("  フロア番号を読み取れませんでした")
+            return
+
+        last = self.stats.floor_last
+        if last is not None and not (last <= value <= last + 1):
+            # 1戦で進むのは1フロアだけで、戻ることもない。読み違いかもしれないが、
+            # どちらが正しいか決められないので、警告だけ出してそのまま使う。
+            log.warning("  フロア番号が不自然です（前回 %d → 今回 %d）", last, value)
+        if self.stats.floor_first is None:
+            self.stats.floor_first = value
+        self.stats.floor_last = value
+        self._floor = value
+        log.info("  フロア番号: %d", value)
+
+    def _on_guild_modes(self, state, match, screen_gray, rect) -> None:
+        log.info("[%s] 結社戦線を開きます", state.label)
+        if not self._click_template("結社戦線_card", screen_gray, rect):
+            self._escalate(rect)
+
+    def _on_mode_menu(self, state, match, screen_gray, rect) -> None:
+        log.info("[%s] ギルドのカテゴリへ移ります", state.label)
+        if not self._click_template("ギルド_tab", screen_gray, rect):
+            log.warning("  ギルドのカテゴリが見つかりません")
+            self._escalate(rect)
+
+    def _on_world_map(self, state, match, screen_gray, rect) -> None:
+        log.info("[%s] ← でワールド画面へ戻ります", state.label)
+        if not self._click_template("戻る_btn", screen_gray, rect):
+            log.warning("  ← が見つかりません")
+            self._escalate(rect)
+
+    def _on_world(self, state, match, screen_gray, rect) -> None:
+        log.info("[%s] モードを開きます", state.label)
+        if not self._click_template("モード_btn", screen_gray, rect):
+            self._escalate(rect)
 
     # ── ステージ進行の追跡（勝利数の計上）────────────────────────────────
 

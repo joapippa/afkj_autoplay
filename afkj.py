@@ -290,6 +290,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[エラー] --modes の指定が不正です: {args.modes}")
         print(f"        使えるのは {names} をカンマで並べたもの（例: 幻霊,シーズン）")
         return 1
+    contents = {st.MODES_BY_KEY[k].content for k in mode_order}
+    if len(contents) > 1:
+        # 先鋒ステージと結社戦線は入口が別の画面で、行き来する手順を持っていない
+        print(f"[エラー] --modes の指定が不正です: {args.modes}")
+        print("        結社戦線は先鋒ステージ（幻霊 / シーズン）と一緒には回せません。")
+        print("        別々に実行してください（例: --modes 結社戦線）")
+        return 1
 
     attempts = _parse_attempts(args.attempts)
     if attempts is None:
@@ -388,7 +395,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="幻霊,シーズン",
         help=(
             "回す先鋒ステージの系統とその順番。前のものを限界まで粘ってから"
-            "次へ移る (既定: 幻霊,シーズン。片方だけなら 幻霊 のように書く)"
+            "次へ移る (既定: 幻霊,シーズン。片方だけなら 幻霊 のように書く)。"
+            "結社戦線を回すときは 結社戦線 とだけ書く"
         ),
     )
     p_run.add_argument(
