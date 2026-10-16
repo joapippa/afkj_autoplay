@@ -267,7 +267,9 @@ def _parse_modes(text: str) -> tuple[str, ...] | None:
 
 # --attempts を省いたときの値（キーは states.SENPO / states.UNION）。結社戦線は20戦に1勝できれば良いほうなので
 # 先鋒よりずっと深く粘る（2026-10-12 ユーザーの判断）。
-DEFAULT_ATTEMPTS = {"senpo": "3,2,1,1,1", "union": "20,10+"}
+# Skip で1戦が約15秒（以前は約75秒）になったので、2番目以降の編成も20回ずつに
+# した（2026-10-17 ユーザーの判断。それまでは 20,10+）。
+DEFAULT_ATTEMPTS = {"senpo": "3,2,1,1,1", "union": "20+"}
 
 
 def _parse_attempts(text: str) -> tuple[tuple[int, ...], bool] | None:
@@ -431,7 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
             "各クリア編成での挑戦回数。3,2,1,1,1 なら1番目の編成で3回、"
             "2番目で2回、3〜5番目で1回ずつ試して諦める。最後に + を付けると"
             "その回数をクリア編成が尽きるまで繰り返す "
-            "(既定: 先鋒ステージ 3,2,1,1,1 / 結社戦線 20,10+)"
+            "(既定: 先鋒ステージ 3,2,1,1,1 / 結社戦線 20+)"
         ),
     )
     p_run.add_argument(
