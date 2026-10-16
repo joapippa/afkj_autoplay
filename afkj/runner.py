@@ -89,6 +89,11 @@ BATTLE_UNKNOWN_SAVES = 3
 # 結社戦線の画面へ戻ってしまう（2026-10-17 07:34〜07:36 の実走で3回起きた）。
 SKIP_RETRY_SECONDS = 30.0
 
+# 「戦闘」を押してから、まだ編成画面が見えていても押し直さずに待つ秒数。
+# 押してから戦闘画面になるまで毎回 6〜9秒かかり、押した回数（2〜4回）に
+# よらなかった（2026-10-17 07:48〜07:50 の9戦）。最初の1回で届いている。
+BATTLE_CLICK_WAIT = 12.0
+
 # Skip を押すまでの判定間隔（秒）。早く押すほど1戦が短くなる。
 # Skip だけを探すなら1回 0.03〜0.1秒で済む（画面全体の判定は1〜2.8秒）。
 SKIP_POLL_SECONDS = 0.3
@@ -337,6 +342,8 @@ class Runner:
         # タップしないために使う。
         self._battle_started_at = 0.0
         self._battle_unknown_saved = 0
+        # 最後に「戦闘」を押した時刻。読み込み中に押し直さないために使う。
+        self._battle_clicked_at = 0.0
         # この戦闘で Skip を押したか、と最後に押した時刻
         self._skip_pressed = False
         self._skip_clicked_at = 0.0
@@ -801,19 +808,33 @@ class Runner:
             log.warning("[%s] 進まないので押すボタンを切り替えます", state.label)
             self._state_since = time.time()
 
+        # 押すボタンは1つだけ。見つからなければ押さずに待つ。
+        # ・代わりに別のボタンを押さない。以前は「戦闘」が見つからないと「クリア編成」を
+        #   押していて、画面が滑り込む途中のフレームで編成ポップアップを開き直していた。
+        # ・_escalate も呼ばない。画面下の中央をタップするので、ここでは『オート挑戦』を押す。
+        # 覚えている状態が実態とずれていたら、上の足踏みの切り替えで直る。
         if self.formation_applied:
-            order = ["戦闘_btn", "クリア編成_btn"]
+            since = time.time() - self._battle_clicked_at
+            if since < BATTLE_CLICK_WAIT:
+                log.info("[%s] 戦闘を押しました。読み込みを待ちます (%.0f秒)", state.label, since)
+                self._battle_started_at = self._battle_clicked_at
+                time.sleep(self.config.poll_interval)
+                return
+            name = "戦闘_btn"
             log.info("[%s] 戦闘を押します", state.label)
         else:
             # クリア編成が見つからなくても戦闘は押さない（編成を当てずに戦うことになる）。
-            # 本当は適用済みだったなら、足踏みの切り替えで戦闘のほうを試す。
-            order = ["クリア編成_btn"]
+            name = "クリア編成_btn"
             log.info("[%s] クリア編成を押します", state.label)
 
-        if self._click_first_available(order, screen_gray, rect) == "戦闘_btn":
+        if not self._click_template(name, screen_gray, rect):
+            log.info("  %s がまだ見えません。少し待ちます", name)
+            time.sleep(self.config.poll_interval)
+            return
+        if name == "戦闘_btn":
             # 戦闘画面を判定できなくても、この戦闘の勝敗は1回として数える
             self._battle_observed = True
-            self._battle_started_at = time.time()
+            self._battle_started_at = self._battle_clicked_at = time.time()
             self._skip_pressed = False
 
     def _on_clear_formation_list(self, state, match, screen_gray, rect) -> None:
@@ -1013,7 +1034,7 @@ class Runner:
         # 同じ編成で挑み直すなら、クリア編成を開かずにそのまま「戦闘」を押す。
         same = self._applied_index is not None and self._applied_index == self._formation_index
         self.formation_applied = same
-        self._battle_started_at = 0.0
+        self._battle_started_at = self._battle_clicked_at = 0.0
         self._skip_pressed = False
 
         if self._giving_up:
@@ -1105,7 +1126,7 @@ class Runner:
         1戦ずつ戦う場合、勝利画面は ← を押すまで残るので見逃さない。
         そのため勝った回数はここで数える。
         """
-        self._battle_started_at = 0.0
+        self._battle_started_at = self._battle_clicked_at = 0.0
         self._skip_pressed = False
         if self._state_changed:
             self._register_victory(screen_gray)
@@ -1309,22 +1330,6 @@ class Runner:
             return False
         self._click_at(match.center, rect, label=name, score=match.score)
         return True
-
-    def _click_first_available(
-        self, names: list[str], screen_gray: np.ndarray, rect: win.WindowRect
-    ) -> str | None:
-        """候補のうち最初に見つかったものをクリックし、その名前を返す。
-
-        ★ 系統（幻霊 / シーズン）のエントリーボタンには使わないこと。
-          押し分けが必要なので、候補を並べると別系統に入ってしまう。
-        """
-        for name in names:
-            if self._click_template(name, screen_gray, rect):
-                return name
-
-        log.warning("  押せるボタンが見つかりません (%s)", ", ".join(names))
-        self._escalate(rect)
-        return None
 
     def _click_at(self, center: tuple[int, int], rect: win.WindowRect, label: str, score: float) -> None:
         x, y = center
