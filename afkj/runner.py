@@ -82,6 +82,10 @@ BATTLE_GRACE_SECONDS = 150.0
 # 戦闘中に判定できなかった画面を保存する上限（テンプレートを切り出す材料）。
 BATTLE_UNKNOWN_SAVES = 3
 
+# Skip を押してから、もう一度押すまでに空ける秒数。結果の画面が出るのが遅れたとき、
+# 押し直したクリックが敗北画面の同じ位置（進捗の帯）に落ちるのを避ける。
+SKIP_RETRY_SECONDS = 5.0
+
 
 def _for_saving(frame: Frame) -> np.ndarray:
     """保存用の画像。カラーがあればカラー（BGR）、なければ白黒。"""
@@ -286,6 +290,10 @@ class Runner:
         # 進行状況のメモ。編成画面では「クリア編成を押したか」で
         # 次に押すボタンが変わるため、これを覚えておく必要がある。
         self.formation_applied = False
+        # 最後に一括適用したクリア編成の番号（0 始まり）。「もう一度」で編成画面へ
+        # 戻ると当てた編成が残っているので、同じ番号で挑み直すなら当て直さない。
+        # ステージが変わったときと、編成画面の外から入り直したときは None に戻す。
+        self._applied_index: int | None = None
 
         # ── 系統（幻霊 / シーズン）の進行管理 ──────────────────────────
         # 今どちらを回しているか。ステージ選択画面でボタンを押し分ける。
@@ -316,6 +324,8 @@ class Runner:
         # タップしないために使う。
         self._battle_started_at = 0.0
         self._battle_unknown_saved = 0
+        # 最後に Skip を押した時刻
+        self._skip_clicked_at = 0.0
         # 今開いているポップアップで「>」を押した回数。
         self._arrow_presses = 0
         # 「>」が続けて見つからなかった回数。
@@ -720,6 +730,8 @@ class Runner:
         self._progress_evidence = ""
         self._arrow_presses = 0
         self._stage_battles = 0
+        # 別のステージにはそのステージのクリア編成を当て直す
+        self._applied_index = None
 
     def _note_progress(self, evidence: str) -> None:
         """ステージを進めた証拠を記録する。
@@ -849,6 +861,7 @@ class Runner:
                 log.info("  記録: %s", path.name)
         if self._click_template("一括適用_btn", screen_gray, rect):
             self.formation_applied = True
+            self._applied_index = self._formation_index
         else:
             log.warning("  一括適用が見つかりません")
             self._escalate(rect)
@@ -866,6 +879,23 @@ class Runner:
             self._tap_dismiss(rect)
             self.stats.recoveries += 1
             self._frozen_since = time.time()
+            return
+
+        # Skip を押せばすぐに勝敗の画面になる。必殺技の演出でボタン列が隠れる
+        # フレームもあるので、見えたときに押す（押せなければ次の判定で押し直す）。
+        skip = (
+            self.store.find("スキップ_btn", screen_gray)
+            if "スキップ_btn" in self.store.templates else None
+        )
+        if skip is not None:
+            since = time.time() - self._skip_clicked_at
+            if since < SKIP_RETRY_SECONDS:
+                log.info("[%s] Skip を押しました。結果の画面を待ちます (%.0f秒)", state.label, since)
+                time.sleep(self.config.poll_interval)
+                return
+            log.info("[%s] Skip で戦闘を飛ばします (%d秒)", state.label, elapsed)
+            self._click_at(skip.center, rect, label="スキップ_btn", score=skip.score)
+            self._skip_clicked_at = time.time()
             return
 
         log.info("[%s] 戦っています... (%d秒)", state.label, elapsed)
@@ -911,7 +941,10 @@ class Runner:
             # 数えて、粘り方も1回だけ進める。
             self._register_defeat()
 
-        self.formation_applied = False
+        # 「もう一度」で戻った編成画面には当てた編成が残っている。
+        # 同じ編成で挑み直すなら、クリア編成を開かずにそのまま「戦闘」を押す。
+        same = self._applied_index is not None and self._applied_index == self._formation_index
+        self.formation_applied = same
         self._battle_started_at = 0.0
 
         if self._giving_up:
@@ -922,9 +955,10 @@ class Runner:
             return
 
         log.info(
-            "[%s] もう一度を押して再挑戦します（%d番目のクリア編成で %d/%d回目）",
+            "[%s] もう一度を押して再挑戦します（%d番目のクリア編成で %d/%d回目・%s）",
             state.label, self._formation_index + 1,
             self._attempts + 1, self._allowed_attempts(),
+            "編成はそのまま" if same else "編成を当て直す",
         )
         if not self._click_template("もう一度_btn", screen_gray, rect):
             log.warning("  もう一度が見つかりません")
@@ -1091,6 +1125,8 @@ class Runner:
         self._mode = mode
         self._giving_up = False
         self.formation_applied = False
+        # 『挑戦』から入り直した編成画面に前の編成が残っているかは確かめていない
+        self._applied_index = None
         self._battle_started_at = 0.0
         self.stats.mode(mode)  # 一度も勝ち負けしなくても内訳に出るように
 
