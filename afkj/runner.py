@@ -82,9 +82,22 @@ BATTLE_GRACE_SECONDS = 150.0
 # 戦闘中に判定できなかった画面を保存する上限（テンプレートを切り出す材料）。
 BATTLE_UNKNOWN_SAVES = 3
 
-# Skip を押してから、もう一度押すまでに空ける秒数。結果の画面が出るのが遅れたとき、
-# 押し直したクリックが敗北画面の同じ位置（進捗の帯）に落ちるのを避ける。
-SKIP_RETRY_SECONDS = 5.0
+# Skip は1戦につき1回だけ押す。この秒数たっても戦闘画面に Skip が見えていたら
+# （押したクリックが届かなかった）押し直す。
+# 早く押し直すのは危ない。Skip を押してから勝敗の画面が出るまで10秒ほどかかり、
+# 押し直したクリックが敗北画面の同じ位置（進捗の帯）に落ちると、もう一度ではなく
+# 結社戦線の画面へ戻ってしまう（2026-10-17 07:34〜07:36 の実走で3回起きた）。
+SKIP_RETRY_SECONDS = 30.0
+
+# Skip を押すまでの判定間隔（秒）。早く押すほど1戦が短くなる。
+# Skip だけを探すなら1回 0.03〜0.1秒で済む（画面全体の判定は1〜2.8秒）。
+SKIP_POLL_SECONDS = 0.3
+
+# 編成ポップアップを閉じるときにタップする位置（画面サイズに対する割合）。
+# ポップアップの外側で、編成画面に戻っていた場合でも何もない場所（右上の木々）。
+# 画面下の中央（_tap_dismiss の位置）は編成画面の『オート挑戦』の上なので使わない
+# （2026-10-17 07:33 にポップアップが閉じた後にタップが届き、オート挑戦が始まった）。
+POPUP_DISMISS_POINT = (1700 / 1920, 450 / 1200)
 
 
 def _for_saving(frame: Frame) -> np.ndarray:
@@ -324,7 +337,8 @@ class Runner:
         # タップしないために使う。
         self._battle_started_at = 0.0
         self._battle_unknown_saved = 0
-        # 最後に Skip を押した時刻
+        # この戦闘で Skip を押したか、と最後に押した時刻
+        self._skip_pressed = False
         self._skip_clicked_at = 0.0
         # 今開いているポップアップで「>」を押した回数。
         self._arrow_presses = 0
@@ -409,6 +423,11 @@ class Runner:
                 continue
 
             screen_gray, rect = frame
+            # 戦闘画面の Skip は画面全体の判定（1〜2.8秒）を待たずに押す。
+            # 判定に時間がかかると、押す時点の画面が撮った画面と違ってしまう。
+            if self._try_skip(screen_gray, rect):
+                continue
+
             state, match = self._identify(screen_gray)
             self._track(state, screen_gray)
             self._record_transition(state, screen_gray)
@@ -795,6 +814,7 @@ class Runner:
             # 戦闘画面を判定できなくても、この戦闘の勝敗は1回として数える
             self._battle_observed = True
             self._battle_started_at = time.time()
+            self._skip_pressed = False
 
     def _on_clear_formation_list(self, state, match, screen_gray, rect) -> None:
         """クリア編成のポップアップ。
@@ -814,12 +834,11 @@ class Runner:
 
         if self._giving_up:
             log.info("[%s] 諦めたのでポップアップを閉じます", state.label)
-            self._tap_dismiss(rect)
+            self._dismiss_popup(state, rect)
             return
 
         if self.formation_applied:
-            log.info("[%s] 適用済み。ポップアップを閉じます", state.label)
-            self._tap_dismiss(rect)
+            self._dismiss_popup(state, rect)
             return
 
         if self._arrow_presses < self._formation_index:
@@ -866,6 +885,34 @@ class Runner:
             log.warning("  一括適用が見つかりません")
             self._escalate(rect)
 
+    def _dismiss_popup(self, state, rect: win.WindowRect) -> None:
+        """一括適用のあとに残った編成ポップアップを閉じる。
+
+        一括適用を押すとポップアップは閉じていく途中なので、判定に使った画面は
+        もう古いことがある。タップする直前に撮り直し、まだ開いているときだけ、
+        編成画面に戻っていても何も起きない位置（POPUP_DISMISS_POINT）をタップする。
+        """
+        fresh = self._capture()
+        if fresh is None:
+            return
+        frame, rect = fresh
+        if self.store.find("一括適用_btn", frame) is None:
+            log.info("[%s] ポップアップはもう閉じています", state.label)
+            return
+        log.info("[%s] 適用済み。ポップアップの外をタップして閉じます", state.label)
+        if self.config.dry_run:
+            log.info("  [判定のみ] タップしません")
+            time.sleep(self.config.poll_interval)
+            return
+        fx, fy = POPUP_DISMISS_POINT
+        x, y = int(rect.width * fx), int(rect.height * fy)
+        sx, sy = rect.to_screen(x, y)
+        log.info("  画面をタップ: 画面内(%d,%d) → 絶対(%d,%d)", x, y, sx, sy)
+        self.game.focus()
+        win.click(sx, sy)
+        self.stats.clicks += 1
+        time.sleep(self.config.after_click)
+
     def _on_in_battle(self, state, match, screen_gray, rect) -> None:
         # 「前回の敗北のあとに戦った」ことの目印。敗北を二重に数えないために使う。
         self._battle_observed = True
@@ -881,25 +928,46 @@ class Runner:
             self._frozen_since = time.time()
             return
 
-        # Skip を押せばすぐに勝敗の画面になる。必殺技の演出でボタン列が隠れる
-        # フレームもあるので、見えたときに押す（押せなければ次の判定で押し直す）。
-        skip = (
-            self.store.find("スキップ_btn", screen_gray)
-            if "スキップ_btn" in self.store.templates else None
-        )
-        if skip is not None:
-            since = time.time() - self._skip_clicked_at
-            if since < SKIP_RETRY_SECONDS:
-                log.info("[%s] Skip を押しました。結果の画面を待ちます (%.0f秒)", state.label, since)
-                time.sleep(self.config.poll_interval)
-                return
-            log.info("[%s] Skip で戦闘を飛ばします (%d秒)", state.label, elapsed)
-            self._click_at(skip.center, rect, label="スキップ_btn", score=skip.score)
-            self._skip_clicked_at = time.time()
-            return
+        if self._skip_pressed:
+            log.info("[%s] Skip を押しました。結果の画面を待ちます (%d秒)", state.label, elapsed)
+        else:
+            log.info("[%s] 戦っています... (%d秒)", state.label, elapsed)
+        time.sleep(self._battle_wait())
 
-        log.info("[%s] 戦っています... (%d秒)", state.label, elapsed)
-        time.sleep(self.config.battle_interval)
+    def _battle_wait(self) -> float:
+        """戦闘中に次の判定までに待つ秒数。Skip を押すまでは短く刻む。"""
+        if not self._skip_pressed and "スキップ_btn" in self.store.templates:
+            return SKIP_POLL_SECONDS
+        return self.config.poll_interval if self._skip_pressed else self.config.battle_interval
+
+    def _try_skip(self, screen_gray: Frame, rect: win.WindowRect) -> bool:
+        """戦闘画面の Skip が見えたら押す。押したら True。
+
+        Skip を押すとすぐに勝敗の画面へ進む（演出を含めて10秒ほど）。押すのは
+        1戦につき1回だけ。押し直しは SKIP_RETRY_SECONDS たっても Skip が
+        見えているときに限る（理由は定数の説明を参照）。
+        Skip は戦闘画面にしか出ないので、画面全体の判定より先に調べてよい
+        （Skip の無い画面での一致度は最大 0.644、しきい値は 0.85）。
+        """
+        if "スキップ_btn" not in self.store.templates:
+            return False
+        since = time.time() - self._skip_clicked_at
+        if self._skip_pressed and since < SKIP_RETRY_SECONDS:
+            return False
+        skip = self.store.find("スキップ_btn", screen_gray)
+        if skip is None:
+            return False
+        if self._skip_pressed:
+            log.warning("Skip を押して %.0f秒 たっても戦闘画面のままです。押し直します", since)
+        else:
+            started = time.time() - self._battle_started_at if self._battle_started_at else 0.0
+            log.info("[戦闘中] Skip で戦闘を飛ばします（戦闘を押して %.0f秒）", started)
+        self._click_at(skip.center, rect, label="スキップ_btn", score=skip.score)
+        self._skip_pressed = True
+        self._skip_clicked_at = time.time()
+        # 「前回の敗北のあとに戦った」ことの目印（_on_in_battle と同じ）
+        self._battle_observed = True
+        return True
 
     def _on_loading(self, state, match, screen_gray, rect) -> None:
         log.info("[%s] 読み込みを待ちます (%d秒)", state.label, int(self._stuck_for()))
@@ -946,6 +1014,7 @@ class Runner:
         same = self._applied_index is not None and self._applied_index == self._formation_index
         self.formation_applied = same
         self._battle_started_at = 0.0
+        self._skip_pressed = False
 
         if self._giving_up:
             log.info("[%s] 諦めたので ← で%sへ戻ります", state.label, self._entry_screen_label())
@@ -1037,6 +1106,7 @@ class Runner:
         そのため勝った回数はここで数える。
         """
         self._battle_started_at = 0.0
+        self._skip_pressed = False
         if self._state_changed:
             self._register_victory(screen_gray)
 
@@ -1329,7 +1399,7 @@ class Runner:
             if in_battle > 10.0 and self._battle_unknown_saved < BATTLE_UNKNOWN_SAVES:
                 self._battle_unknown_saved += 1
                 self._save_debug(screen_gray, f"battle_unknown_{self._battle_unknown_saved}")
-            time.sleep(self.config.battle_interval)
+            time.sleep(self._battle_wait())
             return
 
         self._unknown_streak += 1

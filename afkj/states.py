@@ -190,9 +190,11 @@ STATES: tuple[StateSpec, ...] = (
     StateSpec(
         key=DEFEAT,
         label="戦闘敗北",
-        detect=("戦闘敗北",),
+        # 見出しは演出のきらめきが重なると 0.85 を割る（見出しが出ているのに
+        # 判定できず5秒待った）。敗北画面にしか出ない帯でも見分ける。
+        detect=("戦闘敗北", "敗北おすすめ"),
         priority=30,
-        note="敗北画面。見出しの『敗北』だけで見分ける",
+        note="敗北画面。見出しの『敗北』か『おすすめの強化方法』の帯で見分ける",
     ),
     StateSpec(
         key=VICTORY,
